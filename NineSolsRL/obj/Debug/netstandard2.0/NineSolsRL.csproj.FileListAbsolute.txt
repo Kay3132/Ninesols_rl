@@ -1,0 +1,5 @@
+E:\Ninesols_rl\NineSolsRL\obj\Debug\netstandard2.0\NineSolsRL.csproj.AssemblyReference.cache
+E:\Ninesols_rl\NineSolsRL\obj\Debug\netstandard2.0\NineSolsRL.GeneratedMSBuildEditorConfig.editorconfig
+E:\Ninesols_rl\NineSolsRL\obj\Debug\netstandard2.0\NineSolsRL.AssemblyInfoInputs.cache
+E:\Ninesols_rl\NineSolsRL\obj\Debug\netstandard2.0\NineSolsRL.AssemblyInfo.cs
+E:\Ninesols_rl\NineSolsRL\obj\Debug\netstandard2.0\NineSolsRL.csproj.CoreCompileInputs.cache
