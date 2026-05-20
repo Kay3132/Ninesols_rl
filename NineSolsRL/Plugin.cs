@@ -1,8 +1,7 @@
 using System;
-using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
+using System.Threading.Tasks;
 using BepInEx;
 using UnityEngine;
 using HarmonyLib;
@@ -14,11 +13,10 @@ namespace NineSolsRL
     {
         public static Plugin Instance;
 
-        private TcpListener _server;
-        private TcpClient _client;
         private NetworkStream _stream;
-        private Thread _listenThread;
-        private bool _running = false;
+        private TcpClient _pendingClient;
+        private Task _connectTask;
+        private bool _connected = false;
 
         private int _actionMove  = 0;
         private int _actionSkill = 0;
@@ -28,11 +26,6 @@ namespace NineSolsRL
             Instance = this;
             DontDestroyOnLoad(this.gameObject);
             Logger.LogInfo("NineSolsRL 啟動...");
-            _running = true;
-            _listenThread = new Thread(ListenForPython);
-            _listenThread.IsBackground = true;
-            _listenThread.Start();
-
             var harmony = new Harmony("com.ninesolsrl.plugin");
             harmony.PatchAll();
         }
@@ -53,13 +46,87 @@ namespace NineSolsRL
             if (_debugTick % 60 == 0)
             {
                 var p = Player.i;
-                var ph = FindObjectOfType<PlayerHealth>();
-                Logger.LogInfo($"[RL Debug] tick={_debugTick} connected={_connected} Player={p != null} PlayerHealth={ph != null}");
+                var ph = p?.GetComponentInChildren<PlayerHealth>(true);
+                Logger.LogInfo($"[RL Debug] tick={_debugTick} connected={_connected} Player={p != null} PH={ph != null}");
             }
-            if (!_connected) return;
-            var state = GetGameState();
-            if (state == null) return;
-            SendState(state);
+
+            if (!_connected)
+            {
+                TryConnect();
+                return;
+            }
+
+            // 讀取 Python 傳來的 action（非阻塞）
+            try
+            {
+                if (_stream?.DataAvailable == true)
+                {
+                    var buf = new byte[4096];
+                    int n = _stream.Read(buf, 0, buf.Length);
+                    if (n > 0)
+                        ParseAction(Encoding.UTF8.GetString(buf, 0, n).Trim());
+                    else
+                    { Disconnect(); return; }
+                }
+            }
+            catch { Disconnect(); return; }
+
+            // 每 6 tick 送一次 state（約 10Hz），避免 TCP 積壓
+            if (_debugTick % 6 == 0)
+            {
+                var state = GetGameState();
+                if (state != null) SendState(state);
+            }
+        }
+
+        private void TryConnect()
+        {
+            // 等到 tick=300 才開始嘗試（讓遊戲完全載入）
+            if (_debugTick < 300) return;
+
+            // 檢查進行中的連線
+            if (_connectTask != null)
+            {
+                if (!_connectTask.IsCompleted) return;
+
+                if (!_connectTask.IsFaulted && _pendingClient != null && _pendingClient.Connected)
+                {
+                    Logger.LogInfo("已連線到 Python！");
+                    _stream = _pendingClient.GetStream();
+                    _connected = true;
+                }
+                else
+                {
+                    Logger.LogInfo($"connect 失敗 (tick={_debugTick})，重試中...");
+                    try { _pendingClient?.Close(); } catch { }
+                    _pendingClient = null;
+                }
+                _connectTask = null;
+                return;
+            }
+
+            // 每 180 tick（約 3 秒）嘗試一次
+            if (_debugTick % 180 != 0) return;
+
+            Logger.LogInfo($"ConnectAsync 127.0.0.1:19271 (tick={_debugTick})...");
+            _pendingClient = new TcpClient();
+            try { _connectTask = _pendingClient.ConnectAsync("127.0.0.1", 19271); }
+            catch (Exception ex)
+            {
+                Logger.LogInfo("ConnectAsync 例外: " + ex.Message);
+                _pendingClient = null;
+            }
+        }
+
+        private void Disconnect()
+        {
+            Logger.LogInfo("Python 斷線，重新嘗試連線...");
+            try { _stream?.Close(); } catch { }
+            try { _pendingClient?.Close(); } catch { }
+            _stream = null;
+            _pendingClient = null;
+            _connectTask = null;
+            _connected = false;
         }
 
         private string GetGameState()
@@ -68,24 +135,29 @@ namespace NineSolsRL
             {
                 var player = Player.i;
                 if (player == null) return null;
-                var playerHealth = player.GetComponent<PlayerHealth>();
+                var playerHealth = player.GetComponentInChildren<PlayerHealth>(true);
                 if (playerHealth == null) return null;
 
                 float px  = player.transform.position.x;
                 float py  = player.transform.position.y;
                 float php = playerHealth.CurrentHealthValue;
 
-                float bx = -1, by = -1, bhp = 0, bhpMax = 1;
+                float bx = -1, by = -1, bhp = -1, bhpMax = 1;
+                bool bossPresent = false;
                 var boss = FindObjectOfType<MonsterBase>();
                 if (boss != null)
                 {
-                    bx     = boss.transform.position.x;
-                    by     = boss.transform.position.y;
-                    bhp    = boss.health.currentValue;
-                    bhpMax = 100f;
+                    bx        = boss.transform.position.x;
+                    by        = boss.transform.position.y;
+                    bhp       = boss.health.currentValue;
+                    bhpMax    = boss.health.maxValue > 0 ? boss.health.maxValue : 1f;
+                    bossPresent = true;
+                    if (_debugTick % 60 == 0)
+                        Logger.LogInfo($"[Boss] {boss.name} hp={bhp}/{bhpMax}");
                 }
 
-                bool done = (php <= 0) || (bhp <= 0);
+                // done: 玩家死亡，或 boss 出現過但血量歸零
+                bool done = (php <= 0) || (bossPresent && bhp <= 0);
 
                 return $"{{\"px\":{px},\"py\":{py}," +
                        $"\"php\":{php}," +
@@ -108,66 +180,7 @@ namespace NineSolsRL
                 var bytes = Encoding.UTF8.GetBytes(json);
                 _stream.Write(bytes, 0, bytes.Length);
             }
-            catch { _stream = null; }
-        }
-
-        private volatile bool _connected = false;
-        private void ListenForPython()
-        {
-            try
-            {
-                Logger.LogInfo("等待 5 秒...");
-                System.Threading.Thread.Sleep(5000);
-                Logger.LogInfo("開始啟動 TCP server...");
-
-                _server = new TcpListener(IPAddress.Loopback, 19271);
-                _server.Start();
-                Logger.LogInfo("TCP server 啟動成功，port 19271");
-
-                Logger.LogInfo("等待 Python 連線...");
-                int pollHeartbeat = 0;
-                while (_running)
-                {
-                    bool ready = false;
-                    try { ready = _server.Server.Poll(0, System.Net.Sockets.SelectMode.SelectRead); }
-                    catch (Exception ex) { Logger.LogError("Poll 失敗: " + ex.Message); System.Threading.Thread.Sleep(50); continue; }
-
-                    pollHeartbeat++;
-                    if (pollHeartbeat % 300 == 0)
-                        Logger.LogInfo($"[Poll 心跳] iter={pollHeartbeat} ready={ready} server_bound={_server.Server.IsBound}");
-
-                    if (!ready) { System.Threading.Thread.Sleep(10); continue; }
-
-                    Logger.LogInfo("偵測到連線，嘗試 Accept...");
-                    System.Net.Sockets.TcpClient tcpClient;
-                    try { tcpClient = _server.AcceptTcpClient(); }
-                    catch (Exception ex) { Logger.LogError("Accept 失敗: " + ex.Message); continue; }
-
-                    _stream = tcpClient.GetStream();
-                    Logger.LogInfo("Python 已連線！");
-                    _connected = true;
-
-                    var buf = new byte[4096];
-                    while (_running)
-                    {
-                        try
-                        {
-                            int n = _stream.Read(buf, 0, buf.Length);
-                            if (n == 0) break;
-                            ParseAction(Encoding.UTF8.GetString(buf, 0, n).Trim());
-                        }
-                        catch { break; }
-                    }
-                    Logger.LogInfo("Python 斷線，重新等待...");
-                    _stream = null;
-                    _client = null;
-                    _connected = false;
-                }
-            }
-            catch (Exception e)
-            {
-                Logger.LogError("ListenForPython 錯誤: " + e.ToString());
-            }
+            catch { Disconnect(); }
         }
 
         private void ParseAction(string json)
@@ -180,7 +193,7 @@ namespace NineSolsRL
             catch { }
         }
 
-        private int ExtractInt(string json, string key)
+        private static int ExtractInt(string json, string key)
         {
             string search = $"\"{key}\":";
             int idx = json.IndexOf(search);
@@ -194,10 +207,7 @@ namespace NineSolsRL
 
         void OnDestroy()
         {
-            _running = false;
-            _stream?.Close();
-            _client?.Close();
-            _server?.Stop();
+            Disconnect();
         }
     }
 }
