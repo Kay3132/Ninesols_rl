@@ -1,19 +1,31 @@
 import socket, json, time
 
-HOST = "127.0.0.1"
-PORT = 19271
+HOST, PORT = "127.0.0.1", 19271
 
-# Action 協定（每個 key 都可同時送）：
+# ---- Action 協定（遊戲 <- Python）----
 #   move:   0=停, 1=左, 2=右
-#   jump:   0/1   跳躍
-#   attack: 0/1   攻擊
-#   dodge:  0/1   閃避/衝刺
-#   parry:  0/1   格檔
+#   jump / attack / dodge / parry: 0/1
+#
+# ---- State 協定（遊戲 -> Python）----
+#   px,py,vx,vy,facing,php,bx,by,b_facing,bhp,bhp_max
+#   controllable: 玩家此刻是否真正可被操作（過場/對話/死亡時為 false）
+#   state:        玩家狀態字串（Normal / Hurt / Dead / Roll ...）
+#   done:         php<=0 或 boss 死亡
 
 
 def send_action(conn, action: dict):
-    msg = json.dumps(action) + "\n"
-    conn.sendall(msg.encode("utf-8"))
+    conn.sendall((json.dumps(action) + "\n").encode("utf-8"))
+
+
+def new_episode_state():
+    """每個 episode 開始時的歸零狀態。"""
+    return {
+        "step": 0,
+        "start": time.time(),
+        "total_reward": 0.0,
+        "prev_php": None,
+        "prev_bhp": None,
+    }
 
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -26,8 +38,11 @@ conn, addr = server.accept()
 print(f"[PY] 遊戲已連線！{addr}")
 
 buf = ""
-state_count = 0
-start = time.time()
+episode = 1
+ep = new_episode_state()
+dead = False          # 是否處於「已死亡、等待重生」階段
+print(f"=== Episode {episode} 開始 ===")
+
 while True:
     try:
         data = conn.recv(4096).decode("utf-8")
@@ -38,39 +53,61 @@ while True:
         print("[PY] 連線中斷")
         break
     buf += data
+
     while "\n" in buf:
         line, buf = buf.split("\n", 1)
         if not line.strip():
             continue
         try:
             state = json.loads(line.strip())
-        except json.JSONDecodeError as e:
-            print(f"[PY] JSON 錯誤: {e}")
+        except json.JSONDecodeError:
             continue
 
-        state_count += 1
-        boss_present = state.get("bx", -1) != -1
+        php   = state.get("php", 1)
+        done  = state.get("done", False)
+        ctrl  = state.get("controllable", False)
+        pstate = state.get("state", "?")
 
-        # ---- 動作測試腳本：每 3 秒換一個動作，逐項驗證 ----
-        phase = int(time.time() - start) // 3 % 5
+        # ---- 死亡偵測：結束目前 episode、歸零 state ----
+        if not dead and (php <= 0 or done or pstate == "Dead"):
+            dead = True
+            survived = time.time() - ep["start"]
+            print(f"=== Episode {episode} 結束 | 步數={ep['step']} "
+                  f"存活={survived:.1f}s 累積獎勵={ep['total_reward']:.1f} ===")
+
+        # ---- 重生偵測：開新 episode，state 歸零 ----
+        if dead and php > 0 and not done and ctrl:
+            dead = False
+            episode += 1
+            ep = new_episode_state()          # ← 歸零
+            print(f"=== Episode {episode} 開始 ===")
+
+        # ---- 死亡/過場中：送停止動作，不累積步數 ----
+        if dead or not ctrl:
+            send_action(conn, {"move": 0})
+            continue
+
+        # ---- 正常步進：簡易測試策略（每 3 秒輪換動作）----
+        ep["step"] += 1
+        phase = int(time.time() - ep["start"]) // 3 % 5
         if phase == 0:
-            action = {"move": 2}                    # 右移
-            label = "右移"
+            action, label = {"move": 2}, "右移"
         elif phase == 1:
-            action = {"move": 1}                    # 左移
-            label = "左移"
+            action, label = {"move": 1}, "左移"
         elif phase == 2:
-            action = {"move": 0, "jump": 1}         # 跳躍
-            label = "跳躍"
+            action, label = {"move": 0, "jump": 1}, "跳躍"
         elif phase == 3:
-            action = {"move": 0, "attack": 1}       # 攻擊
-            label = "攻擊"
+            action, label = {"move": 0, "attack": 1}, "攻擊"
         else:
-            action = {"move": 0, "dodge": 1}        # 閃避
-            label = "閃避"
+            action, label = {"move": 0, "dodge": 1}, "閃避"
+
+        # ---- 簡單獎勵：扣血給負獎勵（示範用）----
+        if ep["prev_php"] is not None and php < ep["prev_php"]:
+            ep["total_reward"] -= (ep["prev_php"] - php)
+        ep["prev_php"] = php
 
         send_action(conn, action)
 
-        if state_count % 20 == 1:
-            print(f"[#{state_count}] {label:4} px={state.get('px'):.1f} "
-                  f"php={state.get('php')} bhp={state.get('bhp')} action={action}")
+        if ep["step"] % 20 == 1:
+            print(f"[E{episode} #{ep['step']:4}] {label} px={state.get('px'):.0f} "
+                  f"php={php} state={pstate} action={action}")

@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.3.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.5.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -80,17 +80,13 @@ namespace NineSolsRL
             {
                 _hmcCalls++;
                 var inst = Instance;
-
-                // 無條件診斷（每 120 次）：用 ReferenceEquals(managed) vs ==(Unity) 對照
-                if (_hmcCalls % 120 == 13)
-                    Log?.LogInfo($"[HMC-DIAG] calls={_hmcCalls} " +
-                        $"instRefNull={ReferenceEquals(inst, null)} instUnityNull={inst == null} " +
-                        $"connected={(ReferenceEquals(inst, null) ? false : inst._connected)} " +
-                        $"argRefNull={ReferenceEquals(__instance, null)} argUnityNull={__instance == null}");
-
                 // 用 ReferenceEquals 做 null 檢查，避免 Unity 的 == 把已 destroy 的 plugin 當成 null
                 if (ReferenceEquals(inst, null) || !inst._connected) return;
                 if (ReferenceEquals(__instance, null)) return;
+
+                // 守門：只有玩家「真正可操作」時才注入移動，
+                // 過場/劇情/傳送時讓遊戲完全掌控
+                if (!IsPlayerControllable(__instance)) return;
 
                 int dir = inst._moveDir;
                 float maxRun;
@@ -105,10 +101,30 @@ namespace NineSolsRL
                     __instance.moveX = 0;                // 交給遊戲自然減速
                 }
 
-                if (++_logTick % 60 == 0)
-                    Log?.LogInfo($"[HMC] dir={dir} moveX={__instance.moveX} " +
-                                 $"VelX={__instance.VelX:F2} maxRun={maxRun:F2}");
+                if (++_logTick % 120 == 0)
+                    Log?.LogInfo($"[HMC] dir={dir} VelX={__instance.VelX:F1} " +
+                                 $"maxRun={maxRun:F1} state={__instance.CurrentStateType}");
             }
+        }
+
+        // 判斷玩家此刻是否真正可被玩家操作（過場/對話/劇情/傳送/死亡時為 false）
+        internal static bool IsPlayerControllable(Player p)
+        {
+            try
+            {
+                if (ReferenceEquals(p, null) || p == null) return false;
+
+                // 輸入狀態必須是 Action（排除 對話/過場/UI/轉場/抽符 等）
+                var pib = p.playerInput;
+                if (pib == null || pib.currentStateType != PlayerInputStateType.Action) return false;
+
+                if (p.CurrentStateType != PlayerStateType.Normal) return false;
+                if (p.IsScriptedMove) return false;
+                if (p.lockMoving) return false;
+                if (p.canMoveNode == null || !p.canMoveNode.gameObject.activeSelf) return false;
+                return true;
+            }
+            catch { return false; }
         }
 
         // 離散動作注入：讓特定 PlayerAction 的 WasPressed 回傳 true
@@ -116,6 +132,7 @@ namespace NineSolsRL
         {
             var inst = Instance;
             if (ReferenceEquals(inst, null) || !inst._connected) return;
+            if (!IsPlayerControllable(Player.i)) return;   // 過場/劇情時不注入動作
             var acts = inst.GetActions();
             if (acts == null) return;
 
@@ -241,44 +258,53 @@ namespace NineSolsRL
             {
                 var player = Player.i;
                 if (player == null) return null;
-                var playerHealth = player.GetComponentInChildren<PlayerHealth>(true);
-                if (playerHealth == null) return null;
+                var ph = player.GetComponentInChildren<PlayerHealth>(true);
+                if (ph == null) return null;
 
-                float px  = player.transform.position.x;
-                float py  = player.transform.position.y;
-                float php = playerHealth.CurrentHealthValue;
+                // ---- 玩家 ----
+                float px = player.transform.position.x;
+                float py = player.transform.position.y;
+                float vx = player.VelX;                          // 真實速度（非差分）
+                float vy = player.VelY;
+                float facing  = player.Facing == Facings.Right ? 1f : -1f;
+                bool  grounded = false;
+                try { grounded = player.IsOnGround; } catch { }
+                float php    = ph.CurrentHealthValue;
+                float phpPct = 0f; try { phpPct = ph.percentage; } catch { }
+                float injury = 0f; try { injury = ph.CurrentInternalInjury; } catch { }   // 內傷
 
-                float now = Time.time;
-                float dt  = now - _prevStateTime;
-                float vx  = dt > 0 ? (px - _prevPx) / dt : 0f;
-                float vy  = dt > 0 ? (py - _prevPy) / dt : 0f;
-                _prevPx = px; _prevPy = py; _prevStateTime = now;
-
-                float facing = player.Facing == Facings.Right ? 1f : -1f;
-
-                float bx = -1, by = -1, bhp = -1, bhpMax = 1, bFacing = 0;
+                // ---- boss / 最近的怪 ----
+                float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0;
                 bool bossPresent = false;
                 var boss = FindObjectOfType<MonsterBase>();
                 if (boss != null)
                 {
-                    bx          = boss.transform.position.x;
-                    by          = boss.transform.position.y;
-                    bhp         = boss.health.currentValue;
-                    bhpMax      = 100f;
-                    bFacing     = boss.transform.localScale.x >= 0 ? 1f : -1f;
+                    bx = boss.transform.position.x;
+                    by = boss.transform.position.y;
+                    try { bvx = boss.VelX; bvy = boss.VelY; } catch { }
+                    try { bFacing = boss.Facing == Facings.Right ? 1f : -1f; } catch { }
+                    try { bhp = boss.health.currentValue; bhpPct = boss.health.percentage; } catch { }
                     bossPresent = true;
                 }
+                float bdx = bossPresent ? bx - px : 0f;          // 相對位置
+                float bdy = bossPresent ? by - py : 0f;
 
                 bool done = (php <= 0) || (bossPresent && bhp <= 0);
+                bool controllable = IsPlayerControllable(player);
+                string state = player.CurrentStateType.ToString();
 
-                return $"{{\"px\":{px},\"py\":{py}," +
-                       $"\"vx\":{vx},\"vy\":{vy}," +
-                       $"\"facing\":{facing}," +
-                       $"\"php\":{php}," +
-                       $"\"bx\":{bx},\"by\":{by}," +
-                       $"\"b_facing\":{bFacing}," +
-                       $"\"bhp\":{bhp},\"bhp_max\":{bhpMax}," +
-                       $"\"done\":{(done ? "true" : "false")}}}\n";
+                return "{" +
+                    $"\"px\":{px},\"py\":{py},\"vx\":{vx},\"vy\":{vy}," +
+                    $"\"facing\":{facing},\"grounded\":{(grounded ? "true" : "false")}," +
+                    $"\"php\":{php},\"php_pct\":{phpPct},\"internal_injury\":{injury}," +
+                    $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
+                    $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
+                    $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
+                    $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct}," +
+                    $"\"controllable\":{(controllable ? "true" : "false")}," +
+                    $"\"state\":\"{state}\"," +
+                    $"\"done\":{(done ? "true" : "false")}" +
+                    "}\n";
             }
             catch (Exception e)
             {
