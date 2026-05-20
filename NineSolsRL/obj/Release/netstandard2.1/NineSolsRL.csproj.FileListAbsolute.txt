@@ -145,3 +145,4 @@ E:\Ninesols_rl\NineSolsRL\obj\Release\netstandard2.1\NineSolsRL.csproj.CoreCompi
 E:\Ninesols_rl\NineSolsRL\obj\Release\netstandard2.1\NineSolsRL.csproj.Up2Date
 E:\Ninesols_rl\NineSolsRL\obj\Release\netstandard2.1\NineSolsRL.dll
 E:\Ninesols_rl\NineSolsRL\obj\Release\netstandard2.1\NineSolsRL.pdb
+E:\Ninesols_rl\NineSolsRL\obj\Release\netstandard2.1\NineSolsRL.sourcelink.json

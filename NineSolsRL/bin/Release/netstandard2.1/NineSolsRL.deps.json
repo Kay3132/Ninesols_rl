@@ -12,9 +12,13 @@
           "0Harmony": "2.9.0.0",
           "Assembly-CSharp": "0.0.0.0",
           "BepInEx": "5.4.23.5",
+          "InControl": "0.0.0.0",
           "rcg.rcgmakercore.Runtime": "0.0.0.0",
+          "UnityEngine.AnimationModule": "0.0.0.0",
+          "UnityEngine.AudioModule": "0.0.0.0",
           "UnityEngine.CoreModule": "0.0.0.0",
-          "UnityEngine": "0.0.0.0"
+          "UnityEngine": "0.0.0.0",
+          "UnityEngine.Physics2DModule": "0.0.0.0"
         },
         "runtime": {
           "NineSolsRL.dll": {}
@@ -44,9 +48,33 @@
           }
         }
       },
+      "InControl/0.0.0.0": {
+        "runtime": {
+          "InControl.dll": {
+            "assemblyVersion": "0.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
       "rcg.rcgmakercore.Runtime/0.0.0.0": {
         "runtime": {
           "rcg.rcgmakercore.Runtime.dll": {
+            "assemblyVersion": "0.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "UnityEngine.AnimationModule/0.0.0.0": {
+        "runtime": {
+          "UnityEngine.AnimationModule.dll": {
+            "assemblyVersion": "0.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "UnityEngine.AudioModule/0.0.0.0": {
+        "runtime": {
+          "UnityEngine.AudioModule.dll": {
             "assemblyVersion": "0.0.0.0",
             "fileVersion": "0.0.0.0"
           }
@@ -63,6 +91,14 @@
       "UnityEngine/0.0.0.0": {
         "runtime": {
           "UnityEngine.dll": {
+            "assemblyVersion": "0.0.0.0",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "UnityEngine.Physics2DModule/0.0.0.0": {
+        "runtime": {
+          "UnityEngine.Physics2DModule.dll": {
             "assemblyVersion": "0.0.0.0",
             "fileVersion": "0.0.0.0"
           }
@@ -87,14 +123,6 @@
       "UnityEngine.DSPGraphModule/0.0.0.0": {
         "runtime": {
           "UnityEngine.DSPGraphModule.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
-          }
-        }
-      },
-      "UnityEngine.AudioModule/0.0.0.0": {
-        "runtime": {
-          "UnityEngine.AudioModule.dll": {
             "assemblyVersion": "0.0.0.0",
             "fileVersion": "0.0.0.0"
           }
@@ -199,22 +227,6 @@
       "UnityEngine.PerformanceReportingModule/0.0.0.0": {
         "runtime": {
           "UnityEngine.PerformanceReportingModule.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
-          }
-        }
-      },
-      "UnityEngine.Physics2DModule/0.0.0.0": {
-        "runtime": {
-          "UnityEngine.Physics2DModule.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
-          }
-        }
-      },
-      "UnityEngine.AnimationModule/0.0.0.0": {
-        "runtime": {
-          "UnityEngine.AnimationModule.dll": {
             "assemblyVersion": "0.0.0.0",
             "fileVersion": "0.0.0.0"
           }
@@ -708,14 +720,6 @@
           }
         }
       },
-      "InControl/0.0.0.0": {
-        "runtime": {
-          "InControl.dll": {
-            "assemblyVersion": "0.0.0.0",
-            "fileVersion": "0.0.0.0"
-          }
-        }
-      },
       "UniTask.DOTween/0.0.0.0": {
         "runtime": {
           "UniTask.DOTween.dll": {
@@ -1099,7 +1103,22 @@
       "serviceable": false,
       "sha512": ""
     },
+    "InControl/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
     "rcg.rcgmakercore.Runtime/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "UnityEngine.AnimationModule/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "UnityEngine.AudioModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
@@ -1110,6 +1129,11 @@
       "sha512": ""
     },
     "UnityEngine/0.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "UnityEngine.Physics2DModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
@@ -1125,11 +1149,6 @@
       "sha512": ""
     },
     "UnityEngine.DSPGraphModule/0.0.0.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "UnityEngine.AudioModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
@@ -1195,16 +1214,6 @@
       "sha512": ""
     },
     "UnityEngine.PerformanceReportingModule/0.0.0.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "UnityEngine.Physics2DModule/0.0.0.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "UnityEngine.AnimationModule/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
@@ -1510,11 +1519,6 @@
       "sha512": ""
     },
     "QFSW.QC/0.0.0.0": {
-      "type": "reference",
-      "serviceable": false,
-      "sha512": ""
-    },
-    "InControl/0.0.0.0": {
       "type": "reference",
       "serviceable": false,
       "sha512": ""
