@@ -21,7 +21,7 @@ INJ_SCALE = 100.0    # 內傷
 class NineSolsEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    OBS_DIM = 15
+    OBS_DIM = 18
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
                  max_steps: int = 2000):
@@ -56,6 +56,9 @@ class NineSolsEnv(gym.Env):
             s.get("b_facing", 0.0),
             s.get("bhp_pct", 0.0),
             1.0 if s.get("controllable") else 0.0,
+            s.get("last_parry_result", 0) / 2.0,    # 0 無 / 0.5 不精確 / 1 精確
+            1.0 if s.get("boss_windup") else 0.0,    # boss 攻擊前置（預警）
+            1.0 if s.get("boss_attacking") else 0.0, # boss 攻擊中
         ], dtype=np.float32)
 
     @staticmethod

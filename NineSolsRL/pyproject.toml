@@ -7,8 +7,18 @@ dependencies = [
     "gymnasium>=0.29",
     "numpy>=1.24",
     "stable-baselines3>=2.3",
+    "torch>=2.0",
 ]
 
 # 這是應用程式專案，不是要發佈的套件，uv 不需要 build 它
 [tool.uv]
 package = false
+
+# torch 改從 PyTorch 官方 CUDA index 安裝（cu128），用 GPU 訓練
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

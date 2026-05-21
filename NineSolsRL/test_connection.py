@@ -78,19 +78,19 @@ def run_session(conn):
                 send_action(conn, {"move": 0})
                 continue
 
-            # ---- 正常步進：簡易測試策略（每 3 秒輪換動作）----
+            # ---- 正常步進：逐一測試 8 個動作（每 3 秒換一個）----
+            # 協定： move 0停/1左/2右   dodge 0無/1跳/2衝刺
+            #        attack 0無/1近戰/2遠程/3格檔/4貼符
             ep["step"] += 1
-            phase = int(time.time() - ep["start"]) // 3 % 5
-            if phase == 0:
-                action, label = {"move": 2}, "右移"
-            elif phase == 1:
-                action, label = {"move": 1}, "左移"
-            elif phase == 2:
-                action, label = {"move": 0, "jump": 1}, "跳躍"
-            elif phase == 3:
-                action, label = {"move": 0, "attack": 1}, "攻擊"
-            else:
-                action, label = {"move": 0, "dodge": 1}, "閃避"
+            phase = int(time.time() - ep["start"]) // 3 % 8
+            if   phase == 0: action, label = {"move": 2},    "右移"
+            elif phase == 1: action, label = {"move": 1},    "左移"
+            elif phase == 2: action, label = {"dodge": 1},   "跳躍"
+            elif phase == 3: action, label = {"dodge": 2},   "衝刺"
+            elif phase == 4: action, label = {"attack": 1},  "近戰"
+            elif phase == 5: action, label = {"attack": 2},  "遠程"
+            elif phase == 6: action, label = {"attack": 3},  "格檔"
+            else:            action, label = {"attack": 4},  "貼符"
 
             # ---- 簡單獎勵：扣血給負獎勵（示範用）----
             if ep["prev_php"] is not None and php < ep["prev_php"]:
@@ -99,10 +99,11 @@ def run_session(conn):
 
             send_action(conn, action)
 
-            if ep["step"] % 20 == 1:
+            if ep["step"] % 10 == 1:
                 print(f"[E{episode} #{ep['step']:4}] {label} "
                       f"px={state.get('px'):.0f} php={php} "
-                      f"bhp_pct={state.get('bhp_pct', 0):.2f} state={pstate}")
+                      f"qi%={state.get('qi_pct', 0):.2f} "
+                      f"bhp%={state.get('bhp_pct', 0):.2f} state={pstate}")
 
 
 def main():

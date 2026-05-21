@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.7.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.9.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -28,7 +28,13 @@ namespace NineSolsRL
         private int _jumpPulse, _dashPulse, _meleePulse, _rangedPulse, _parryPulse, _talismanPulse;
         private const int PULSE = 3;                    // 離散動作維持的幀數
 
+        // 格檔：_lastParryResult 0 無 / 1 不精確 / 2 精確；_parryCount 累計成功格檔次數（reward 用）
+        private int _lastParryResult = 0;
+        private int _parryCount = 0;
+
         private int _debugTick = 0;
+        private float _lastStateTime = 0f;              // 上次送 state 的真實時間（穩定頻率用）
+        private const float SEND_INTERVAL = 1f / 30f;   // 固定 30Hz 送 state
 
         void Awake()
         {
@@ -104,6 +110,23 @@ namespace NineSolsRL
                 if (++_logTick % 120 == 0)
                     Log?.LogInfo($"[HMC] dir={dir} VelX={__instance.VelX:F1} " +
                                  $"maxRun={maxRun:F1} state={__instance.CurrentStateType}");
+            }
+        }
+
+        // 格檔結果偵測：玩家成功格檔時記錄精確/不精確
+        [HarmonyPatch(typeof(ParriableAttackEffect), "EffectParried")]
+        public static class PatchEffectParried
+        {
+            static void Postfix(ParryResultData data)
+            {
+                var inst = Instance;
+                if (ReferenceEquals(inst, null)) return;
+                try
+                {
+                    inst._lastParryResult = data.isAccurate ? 2 : 1;   // 精確=2 不精確=1
+                    inst._parryCount++;                                // 累計成功格檔
+                }
+                catch { }
             }
         }
 
@@ -189,9 +212,10 @@ namespace NineSolsRL
             }
             catch { Disconnect(); return; }
 
-            // 每 6 tick 送一次 state（約 10Hz）
-            if (_debugTick % 6 == 0)
+            // 綁真實時間送 state（固定 30Hz，不隨 fps 浮動）
+            if (Time.unscaledTime - _lastStateTime >= SEND_INTERVAL)
             {
+                _lastStateTime = Time.unscaledTime;
                 var state = GetGameState();
                 if (state != null) SendState(state);
             }
@@ -287,10 +311,19 @@ namespace NineSolsRL
                 }
                 catch { }
 
-                // ---- boss / 最近的怪 ----
+                // ---- boss：挑等級最高的怪（避免抓到召喚的小怪）----
                 float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0;
-                bool bossPresent = false;
-                var boss = FindObjectOfType<MonsterBase>();
+                int bossFsm = 0;
+                bool bossPresent = false, bWindup = false, bAttacking = false;
+                MonsterBase boss = null;
+                int bestLevel = int.MinValue;
+                foreach (var m in FindObjectsOfType<MonsterBase>())
+                {
+                    if (m == null) continue;
+                    int lvl = 0;
+                    try { lvl = (int)m.monsterStat.monsterLevel; } catch { }
+                    if (lvl > bestLevel) { bestLevel = lvl; boss = m; }
+                }
                 if (boss != null)
                 {
                     bx = boss.transform.position.x;
@@ -298,6 +331,16 @@ namespace NineSolsRL
                     try { bvx = boss.VelX; bvy = boss.VelY; } catch { }
                     try { bFacing = boss.Facing == Facings.Right ? 1f : -1f; } catch { }
                     try { bhp = boss.health.currentValue; bhpPct = boss.health.percentage; } catch { }
+                    // 粗粒度 FSM 狀態：AttackPrepose* = 攻擊前置(預警)、Attack* = 攻擊中
+                    try
+                    {
+                        var cs = boss.CurrentState;
+                        bossFsm = (int)cs;
+                        string csName = cs.ToString();
+                        bWindup = csName.Contains("Prepose") || csName == "PreAttack";
+                        bAttacking = csName.StartsWith("Attack") && !bWindup && !csName.Contains("Parrying");
+                    }
+                    catch { }
                     bossPresent = true;
                 }
                 float bdx = bossPresent ? bx - px : 0f;          // 相對位置
@@ -312,10 +355,14 @@ namespace NineSolsRL
                     $"\"facing\":{facing},\"grounded\":{(grounded ? "true" : "false")}," +
                     $"\"php\":{php},\"php_pct\":{phpPct},\"internal_injury\":{injury}," +
                     $"\"qi\":{qi},\"qi_max\":{qiMax},\"qi_pct\":{qiPct}," +
+                    $"\"last_parry_result\":{_lastParryResult},\"parry_count\":{_parryCount}," +
                     $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
                     $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
                     $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
                     $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct}," +
+                    $"\"boss_fsm\":{bossFsm}," +
+                    $"\"boss_windup\":{(bWindup ? "true" : "false")}," +
+                    $"\"boss_attacking\":{(bAttacking ? "true" : "false")}," +
                     $"\"controllable\":{(controllable ? "true" : "false")}," +
                     $"\"state\":\"{state}\"," +
                     $"\"done\":{(done ? "true" : "false")}" +
