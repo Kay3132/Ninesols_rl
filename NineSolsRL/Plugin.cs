@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.5.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.7.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -20,12 +20,12 @@ namespace NineSolsRL
         private Task _connectTask;
         private bool _connected = false;
 
-        private float _prevPx = 0, _prevPy = 0;
-        private float _prevStateTime = 0;
-
         // ---- RL action 狀態 ----
-        private int _moveDir = 0;                       // -1 左, 0 停, 1 右
-        private int _jumpPulse, _attackPulse, _dodgePulse, _parryPulse;
+        // move:   -1 左, 0 停, 1 右
+        // dodge:  0 無 / 1 跳 / 2 衝刺
+        // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符
+        private int _moveDir = 0;
+        private int _jumpPulse, _dashPulse, _meleePulse, _rangedPulse, _parryPulse, _talismanPulse;
         private const int PULSE = 3;                    // 離散動作維持的幀數
 
         private int _debugTick = 0;
@@ -136,10 +136,12 @@ namespace NineSolsRL
             var acts = inst.GetActions();
             if (acts == null) return;
 
-            if      (inst._jumpPulse   > 0 && ReferenceEquals(__instance, acts.Jump))   __result = true;
-            else if (inst._attackPulse > 0 && ReferenceEquals(__instance, acts.Attack)) __result = true;
-            else if (inst._dodgePulse  > 0 && ReferenceEquals(__instance, acts.Dodge))  __result = true;
-            else if (inst._parryPulse  > 0 && ReferenceEquals(__instance, acts.Parry))  __result = true;
+            if      (inst._jumpPulse     > 0 && ReferenceEquals(__instance, acts.Jump))         __result = true;
+            else if (inst._dashPulse     > 0 && ReferenceEquals(__instance, acts.Dodge))        __result = true;
+            else if (inst._meleePulse    > 0 && ReferenceEquals(__instance, acts.Attack))       __result = true;
+            else if (inst._rangedPulse   > 0 && ReferenceEquals(__instance, acts.WeaponAttack)) __result = true;
+            else if (inst._parryPulse    > 0 && ReferenceEquals(__instance, acts.Parry))        __result = true;
+            else if (inst._talismanPulse > 0 && ReferenceEquals(__instance, acts.FooAttack))    __result = true;
         }
 
         private PlayerGamePlayActionSet _cachedActions;
@@ -165,10 +167,12 @@ namespace NineSolsRL
             _debugTick++;
 
             // 遞減離散動作脈衝
-            if (_jumpPulse   > 0) _jumpPulse--;
-            if (_attackPulse > 0) _attackPulse--;
-            if (_dodgePulse  > 0) _dodgePulse--;
-            if (_parryPulse  > 0) _parryPulse--;
+            if (_jumpPulse     > 0) _jumpPulse--;
+            if (_dashPulse     > 0) _dashPulse--;
+            if (_meleePulse    > 0) _meleePulse--;
+            if (_rangedPulse   > 0) _rangedPulse--;
+            if (_parryPulse    > 0) _parryPulse--;
+            if (_talismanPulse > 0) _talismanPulse--;
 
             if (!_connected) { TryConnect(); return; }
 
@@ -198,8 +202,9 @@ namespace NineSolsRL
                 string st = "null";
                 try { if (p != null) st = p.CurrentStateType.ToString(); } catch { }
                 Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
-                               $"J={_jumpPulse} A={_attackPulse} D={_dodgePulse} P={_parryPulse} " +
-                               $"hmcCalls={_hmcCalls} state={st}");
+                               $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
+                               $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
+                               $"state={st}");
             }
         }
 
@@ -242,7 +247,7 @@ namespace NineSolsRL
         private void Disconnect()
         {
             _moveDir = 0;
-            _jumpPulse = _attackPulse = _dodgePulse = _parryPulse = 0;
+            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = 0;
             Logger.LogInfo("Python 斷線，重新嘗試連線...");
             try { _stream?.Close(); } catch { }
             try { _pendingClient?.Close(); } catch { }
@@ -273,6 +278,15 @@ namespace NineSolsRL
                 float phpPct = 0f; try { phpPct = ph.percentage; } catch { }
                 float injury = 0f; try { injury = ph.CurrentInternalInjury; } catch { }   // 內傷
 
+                // 氣（Qi）—— 回血與貼符共用的資源
+                float qi = 0f, qiMax = 1f, qiPct = 0f;
+                try
+                {
+                    var en = player.ammo;
+                    if (en != null) { qi = en.Value; qiMax = en.MaxValue; qiPct = en.percentage; }
+                }
+                catch { }
+
                 // ---- boss / 最近的怪 ----
                 float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0;
                 bool bossPresent = false;
@@ -297,6 +311,7 @@ namespace NineSolsRL
                     $"\"px\":{px},\"py\":{py},\"vx\":{vx},\"vy\":{vy}," +
                     $"\"facing\":{facing},\"grounded\":{(grounded ? "true" : "false")}," +
                     $"\"php\":{php},\"php_pct\":{phpPct},\"internal_injury\":{injury}," +
+                    $"\"qi\":{qi},\"qi_max\":{qiMax},\"qi_pct\":{qiPct}," +
                     $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
                     $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
                     $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
@@ -332,16 +347,21 @@ namespace NineSolsRL
                 int last = json.LastIndexOf('{');
                 if (last > 0) json = json.Substring(last);
 
+                // move: 0 停 / 1 左 / 2 右
                 int move = ExtractInt(json, "move");
                 _moveDir = move == 1 ? -1 : move == 2 ? 1 : 0;
 
-                if (ExtractInt(json, "jump")   == 1) _jumpPulse   = PULSE;
-                if (ExtractInt(json, "attack") == 1) _attackPulse = PULSE;
-                if (ExtractInt(json, "dodge")  == 1) _dodgePulse  = PULSE;
-                if (ExtractInt(json, "parry")  == 1) _parryPulse  = PULSE;
+                // dodge: 0 無 / 1 跳 / 2 衝刺
+                int dodge = ExtractInt(json, "dodge");
+                if      (dodge == 1) _jumpPulse = PULSE;
+                else if (dodge == 2) _dashPulse = PULSE;
 
-                // 相容舊欄位 skill（= attack）
-                if (ExtractInt(json, "skill")  == 1) _attackPulse = PULSE;
+                // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符
+                int atk = ExtractInt(json, "attack");
+                if      (atk == 1) _meleePulse    = PULSE;
+                else if (atk == 2) _rangedPulse   = PULSE;
+                else if (atk == 3) _parryPulse    = PULSE;
+                else if (atk == 4) _talismanPulse = PULSE;
             }
             catch { }
         }
