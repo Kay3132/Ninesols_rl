@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.9.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.11.1")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -23,10 +23,13 @@ namespace NineSolsRL
         // ---- RL action 狀態 ----
         // move:   -1 左, 0 停, 1 右
         // dodge:  0 無 / 1 跳 / 2 衝刺
-        // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符
+        // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符 / 5 喝藥
         private int _moveDir = 0;
-        private int _jumpPulse, _dashPulse, _meleePulse, _rangedPulse, _parryPulse, _talismanPulse;
+        private int _jumpPulse, _dashPulse, _meleePulse, _rangedPulse, _parryPulse, _talismanPulse, _healPulse;
         private const int PULSE = 3;                    // 離散動作維持的幀數
+
+        // curriculum：boss 有效 HP 壓到 _bossHpScale × maxHP（1.0 = 不弱化）
+        private float _bossHpScale = 1.0f;
 
         // 格檔：_lastParryResult 0 無 / 1 不精確 / 2 精確；_parryCount 累計成功格檔次數（reward 用）
         private int _lastParryResult = 0;
@@ -34,6 +37,7 @@ namespace NineSolsRL
 
         private int _debugTick = 0;
         private float _lastStateTime = 0f;              // 上次送 state 的真實時間（穩定頻率用）
+        private float _lastGameTime  = 0f;              // 上次送 state 的遊戲時間（算 dt 用）
         private const float SEND_INTERVAL = 1f / 30f;   // 固定 30Hz 送 state
 
         void Awake()
@@ -150,21 +154,46 @@ namespace NineSolsRL
             catch { return false; }
         }
 
+        // 受傷/倒地狀態：PlayerLieDownState / PlayerHurtState 的 OnStateUpdate 都會跑
+        // DodgeCheck()，所以這些狀態下「閃避」可以快速起身/翻滾脫離。
+        internal static bool IsHurtOrDown(Player p)
+        {
+            try
+            {
+                if (ReferenceEquals(p, null) || p == null) return false;
+                var st = p.CurrentStateType;
+                return st == PlayerStateType.LieDown
+                    || st == PlayerStateType.Hurt
+                    || st == PlayerStateType.HurtFlying;
+            }
+            catch { return false; }
+        }
+
         // 離散動作注入：讓特定 PlayerAction 的 WasPressed 回傳 true
         private static void WasPressedPostfix(object __instance, ref bool __result)
         {
             var inst = Instance;
             if (ReferenceEquals(inst, null) || !inst._connected) return;
-            if (!IsPlayerControllable(Player.i)) return;   // 過場/劇情時不注入動作
             var acts = inst.GetActions();
             if (acts == null) return;
+            var p = Player.i;
 
-            if      (inst._jumpPulse     > 0 && ReferenceEquals(__instance, acts.Jump))         __result = true;
-            else if (inst._dashPulse     > 0 && ReferenceEquals(__instance, acts.Dodge))        __result = true;
-            else if (inst._meleePulse    > 0 && ReferenceEquals(__instance, acts.Attack))       __result = true;
-            else if (inst._rangedPulse   > 0 && ReferenceEquals(__instance, acts.WeaponAttack)) __result = true;
-            else if (inst._parryPulse    > 0 && ReferenceEquals(__instance, acts.Parry))        __result = true;
-            else if (inst._talismanPulse > 0 && ReferenceEquals(__instance, acts.FooAttack))    __result = true;
+            if (IsPlayerControllable(p))
+            {
+                // 正常可操作：所有動作都放行
+                if      (inst._jumpPulse     > 0 && ReferenceEquals(__instance, acts.Jump))         __result = true;
+                else if (inst._dashPulse     > 0 && ReferenceEquals(__instance, acts.Dodge))        __result = true;
+                else if (inst._meleePulse    > 0 && ReferenceEquals(__instance, acts.Attack))       __result = true;
+                else if (inst._rangedPulse   > 0 && ReferenceEquals(__instance, acts.WeaponAttack)) __result = true;
+                else if (inst._parryPulse    > 0 && ReferenceEquals(__instance, acts.Parry))        __result = true;
+                else if (inst._talismanPulse > 0 && ReferenceEquals(__instance, acts.FooAttack))    __result = true;
+                else if (inst._healPulse     > 0 && ReferenceEquals(__instance, acts.Heal))         __result = true;
+            }
+            else if (IsHurtOrDown(p))
+            {
+                // 受傷/倒地：只放行「閃避」用來快速起身；其餘動作遊戲本來就會擋
+                if (inst._dashPulse > 0 && ReferenceEquals(__instance, acts.Dodge)) __result = true;
+            }
         }
 
         private PlayerGamePlayActionSet _cachedActions;
@@ -196,6 +225,7 @@ namespace NineSolsRL
             if (_rangedPulse   > 0) _rangedPulse--;
             if (_parryPulse    > 0) _parryPulse--;
             if (_talismanPulse > 0) _talismanPulse--;
+            if (_healPulse     > 0) _healPulse--;
 
             if (!_connected) { TryConnect(); return; }
 
@@ -212,11 +242,14 @@ namespace NineSolsRL
             }
             catch { Disconnect(); return; }
 
-            // 綁真實時間送 state（固定 30Hz，不隨 fps 浮動）
+            // 綁真實時間送 state（固定 30Hz，不隨 fps 浮動）；
+            // dt 用「遊戲時間」算 → 之後遊戲加速時，reward 仍能正確換算
             if (Time.unscaledTime - _lastStateTime >= SEND_INTERVAL)
             {
+                float dt = Time.time - _lastGameTime;
+                _lastGameTime  = Time.time;
                 _lastStateTime = Time.unscaledTime;
-                var state = GetGameState();
+                var state = GetGameState(dt);
                 if (state != null) SendState(state);
             }
 
@@ -228,7 +261,7 @@ namespace NineSolsRL
                 Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
                                $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
                                $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
-                               $"state={st}");
+                               $"heal={_healPulse} bossHpScale={_bossHpScale:F2} state={st}");
             }
         }
 
@@ -271,7 +304,7 @@ namespace NineSolsRL
         private void Disconnect()
         {
             _moveDir = 0;
-            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = 0;
+            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = _healPulse = 0;
             Logger.LogInfo("Python 斷線，重新嘗試連線...");
             try { _stream?.Close(); } catch { }
             try { _pendingClient?.Close(); } catch { }
@@ -281,7 +314,7 @@ namespace NineSolsRL
             _connected = false;
         }
 
-        private string GetGameState()
+        private string GetGameState(float dt)
         {
             try
             {
@@ -312,7 +345,7 @@ namespace NineSolsRL
                 catch { }
 
                 // ---- boss：挑等級最高的怪（避免抓到召喚的小怪）----
-                float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0;
+                float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0, bhpMax = 0;
                 int bossFsm = 0;
                 bool bossPresent = false, bWindup = false, bAttacking = false;
                 MonsterBase boss = null;
@@ -330,7 +363,19 @@ namespace NineSolsRL
                     by = boss.transform.position.y;
                     try { bvx = boss.VelX; bvy = boss.VelY; } catch { }
                     try { bFacing = boss.Facing == Facings.Right ? 1f : -1f; } catch { }
-                    try { bhp = boss.health.currentValue; bhpPct = boss.health.percentage; } catch { }
+                    try
+                    {
+                        // curriculum：把 boss 有效 HP 壓到 cap = scale × maxHP
+                        float maxHp = boss.health.maxHealth.Value;
+                        bhpMax = maxHp;                              // 未縮放滿血（診斷用）
+                        float cap = _bossHpScale * maxHp;
+                        if (_bossHpScale < 1f && boss.health.currentValue > cap)
+                            boss.health.currentValue = cap;
+                        bhp = boss.health.currentValue;
+                        // bhp_pct 相對於 cap 回報 → 不論難度 boss 都「從 100% 開始」
+                        bhpPct = cap > 0f ? Mathf.Clamp01(bhp / cap) : 0f;
+                    }
+                    catch { }
                     // 粗粒度 FSM 狀態：AttackPrepose* = 攻擊前置(預警)、Attack* = 攻擊中
                     try
                     {
@@ -348,6 +393,7 @@ namespace NineSolsRL
 
                 bool done = (php <= 0) || (bossPresent && bhp <= 0);
                 bool controllable = IsPlayerControllable(player);
+                bool knockedDown  = IsHurtOrDown(player);   // 受傷/倒地（可用閃避起身）
                 string state = player.CurrentStateType.ToString();
 
                 return "{" +
@@ -359,11 +405,13 @@ namespace NineSolsRL
                     $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
                     $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
                     $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
-                    $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct}," +
+                    $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct},\"bhp_max\":{bhpMax}," +
                     $"\"boss_fsm\":{bossFsm}," +
                     $"\"boss_windup\":{(bWindup ? "true" : "false")}," +
                     $"\"boss_attacking\":{(bAttacking ? "true" : "false")}," +
                     $"\"controllable\":{(controllable ? "true" : "false")}," +
+                    $"\"knocked_down\":{(knockedDown ? "true" : "false")}," +
+                    $"\"dt\":{dt}," +
                     $"\"state\":\"{state}\"," +
                     $"\"done\":{(done ? "true" : "false")}" +
                     "}\n";
@@ -403,12 +451,16 @@ namespace NineSolsRL
                 if      (dodge == 1) _jumpPulse = PULSE;
                 else if (dodge == 2) _dashPulse = PULSE;
 
-                // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符
+                // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符 / 5 喝藥
                 int atk = ExtractInt(json, "attack");
                 if      (atk == 1) _meleePulse    = PULSE;
                 else if (atk == 2) _rangedPulse   = PULSE;
                 else if (atk == 3) _parryPulse    = PULSE;
                 else if (atk == 4) _talismanPulse = PULSE;
+                else if (atk == 5) _healPulse     = PULSE;
+
+                // boss_hp_scale: curriculum 弱化倍率（封包沒帶就維持原值）
+                _bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
             }
             catch { }
         }
@@ -425,6 +477,26 @@ namespace NineSolsRL
                 end++;
             if (end == start) return 0;
             return int.Parse(json.Substring(start, end - start));
+        }
+
+        // 解析浮點數（curriculum 的 boss_hp_scale 用）；key 不存在或解析失敗回傳 fallback。
+        private static float ExtractFloat(string json, string key, float fallback)
+        {
+            string search = $"\"{key}\":";
+            int idx = json.IndexOf(search);
+            if (idx < 0) return fallback;
+            int start = idx + search.Length;
+            while (start < json.Length && json[start] == ' ') start++;
+            int end = start;
+            while (end < json.Length &&
+                   (char.IsDigit(json[end]) || json[end] == '-' || json[end] == '+' ||
+                    json[end] == '.' || json[end] == 'e' || json[end] == 'E'))
+                end++;
+            if (end == start) return fallback;
+            return float.TryParse(json.Substring(start, end - start),
+                                  System.Globalization.NumberStyles.Float,
+                                  System.Globalization.CultureInfo.InvariantCulture,
+                                  out float v) ? v : fallback;
         }
 
         void OnDestroy()

@@ -8,55 +8,62 @@ rewards.py —— 三層 reward（參考 Hollow Knight RL 論文）
 慣例：所有權重都是「正值」，公式裡明確用 +（獎勵）/ -（懲罰）。
 """
 
-# ---- 權重（全部正值；正負號在公式裡決定）----
-#
-# 重點是各項之間的「比例」，不是絕對值 —— 訓練時 VecNormalize 會對 reward 做
-# 跑動正規化（除以 std），整體放大/縮小同一倍數對訓練等價。這版重新設計了比例：
-#   贏一場 ≈ +300(WIN) +300(打掉滿血 BOSS_HURT) = +600
-#   輸一場 ≈ -100(DEATH) -100(掉滿血 PLAYER_HURT) = -200
-# 舊版 W_WIN=1000 / W_BOSS_HURT=200 比例失衡（打傷 boss 的累積獎勵遠小於勝負），
-# 這版讓「打掉滿血」與「勝利」同量級，sub reward 才推得動 actor。
-W_WIN          = 300.0    # 擊敗 boss             → 獎勵 +
-W_DEATH        = 100.0    # 玩家死亡              → 懲罰 -
-W_BOSS_HURT    = 300.0    # boss 每損失 1.0 血量比例 → 獎勵 +
-W_PLAYER_HURT  = 100.0    # 玩家每損失 1.0 血量比例 → 懲罰 -
-W_ALIVE        = 0.02     # 每步存活              → 獎勵 +（很小，避免鼓勵 idle）
+# ---- 權重----
+# 壓縮極端值，將 Base/Sub 與 Instrumental 的落差控制在 100 倍以內。
+W_WIN          = 50.0     # 擊敗 boss (降維，交給 PPO 的 gamma 折扣去累積)
+W_DEATH        = 20.0     # 玩家死亡 (降維)
+W_BOSS_HURT    = 50.0     # boss 每損失 1.0 血量比例
+W_PLAYER_HURT  = 20.0     # 玩家每損失 1.0 血量比例 (早期調低，讓它敢換血)
 
-# 格檔：只獎勵成功格檔、不懲罰（避免 agent 學成不格檔）。
-# 亂按格檔遊戲自己會讓窗口縮小、parry 失敗 → 自然拿不到獎勵。
-W_PARRY_PRECISE   = 10.0  # 精確格檔              → 獎勵 +（大，主要目標）
-W_PARRY_IMPRECISE = 3.0   # 不精確格檔            → 獎勵 +（小）
+W_MAX_HURT_PENALTY = 20.0  # 設置單局扣血懲罰上限 (剛好等於一條滿血的懲罰量)
 
-# instrumental：引導 agent 主動接戰（解決「進關卡發呆不打」）
-# in_range / face 都要靠近 boss 才拿得到 → 比 idle 的 W_ALIVE 大得多，
-# 梯度自然把 agent 拉向 boss。
-W_APPROACH     = 0.02     # 每拉近 boss 1 單位距離 → 獎勵 +（拉遠則 -）
-W_IN_RANGE     = 0.1      # 處於接戰距離內         → 獎勵 +
-W_FACE_BOSS    = 0.05     # 面向 boss             → 獎勵 +
+W_PARRY_PRECISE   = 5.0   # 精確格檔
+W_PARRY_IMPRECISE = 1.0   # 不精確格檔
 
-ENGAGE_RANGE   = 200.0    # 視為「接戰距離」的水平距離（遊戲單位）
+# --- instrumental：per-step 項一律改「每秒速率」，compute_reward 內乘 dt ---
+# 為什麼改 dt-based：原本「每步固定值」在遊戲加速 / fps 抖動時，「每秒幾步」
+# 會變 → 每秒拿到的 reward 跟著漂。改成「每秒速率 × dt」後不管 1×/2× 加速、
+# fps 怎麼抖，每「遊戲秒」拿到的 reward 都一樣 → 加速訓練→1× 跑可完美銜接。
+W_TIME_PENALTY_PS = -0.3  # 每秒：時間懲罰（原 -0.01/步 @30Hz）
+W_IN_RANGE_PS     = 3.0   # 每秒：處於接戰距離內
+W_FACE_BOSS_PS    = 1.5   # 每秒：面向 boss
+# W_COWARD 從原 -0.2/步(=-6/秒) 大幅調小：原值太大時，「衝過去送死」會比
+# 「在遠處龜縮」總分更高 → agent 學會自殺。接戰動力應來自「打到 boss 的大獎勵」，
+# 而不是「龜縮被重罰」。
+W_COWARD_PS       = -0.6  # 每秒：龜縮（遠離戰區）懲罰
 
+W_APPROACH     = 0.02     # 每拉近 1 單位（位移型，天生與步數無關，不乘 dt）
+ENGAGE_RANGE   = 200.0    # 視為「接戰距離」
 
-def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) -> float:
+def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_instrumental: bool = True) -> tuple[float, float]:
     r = 0.0
+    step_hurt_penalty = 0.0  # 記錄這一步實際扣了多少分
 
     # ---- base：勝負 ----
     if cur.get("done"):
         if cur.get("php", 1) <= 0:
-            r -= W_DEATH                                  # 死亡懲罰
+            r -= W_DEATH
         elif cur.get("boss_present") and cur.get("bhp", 1) <= 0:
-            r += W_WIN                                    # 擊敗 boss
+            r += W_WIN
 
     # ---- sub：血量變化 ----
     if prev is not None:
         dphp = cur.get("php_pct", 1.0) - prev.get("php_pct", 1.0)
         if dphp < 0:
-            r -= (-dphp) * W_PLAYER_HURT                  # 玩家掉血懲罰
+            raw_penalty = (-dphp) * W_PLAYER_HURT
+            
+            # 【核心邏輯：計算剩餘的懲罰額度】
+            remaining_penalty_allowance = W_MAX_HURT_PENALTY - cumulative_hurt
+            if remaining_penalty_allowance > 0:
+                # 確保扣的分數不會超過剩餘額度
+                actual_penalty = min(raw_penalty, remaining_penalty_allowance)
+                r -= actual_penalty
+                step_hurt_penalty = actual_penalty  # 回傳給 env.py 去累加
 
         if cur.get("boss_present") and prev.get("boss_present"):
             dbhp = cur.get("bhp_pct", 1.0) - prev.get("bhp_pct", 1.0)
             if dbhp < 0:
-                r += (-dbhp) * W_BOSS_HURT                # boss 掉血獎勵
+                r += (-dbhp) * W_BOSS_HURT
 
         # 成功格檔 → 獎勵（用 parry_count 上升緣偵測，每次格檔只給一次）
         if cur.get("parry_count", 0) > prev.get("parry_count", 0):
@@ -66,26 +73,33 @@ def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) 
             elif pr == 1:
                 r += W_PARRY_IMPRECISE                    # 不精確格檔
 
-    # ---- instrumental：存活 + 引導接戰 ----
+    # ---- instrumental：時間懲罰 + 引導接戰（per-step 項乘 dt）----
     if use_instrumental:
-        r += W_ALIVE                                      # 存活獎勵
+        # dt：距上一筆 state 經過的「遊戲時間」(秒)。夾住異常值
+        # (第一筆 / 卡頓時 dt 可能異常大或為 0)。
+        dt = cur.get("dt", 1.0 / 30.0)
+        dt = min(max(dt, 0.0), 0.2)
+
+        r += W_TIME_PENALTY_PS * dt                       # 時間懲罰
 
         if cur.get("boss_present"):
             cur_dist = abs(cur.get("bdx", 0.0))
 
-            # 拉近與 boss 的距離 → 獎勵；拉遠 → 懲罰（鼓勵主動接戰）
             if prev is not None and prev.get("boss_present"):
                 prev_dist = abs(prev.get("bdx", 0.0))
-                r += (prev_dist - cur_dist) * W_APPROACH
+                dist_delta = prev_dist - cur_dist
+                # 限制單步移動獎勵上限，避免 Dash 造成的梯度爆炸
+                dist_delta = max(-10.0, min(10.0, dist_delta))
+                r += dist_delta * W_APPROACH               # 位移型，不乘 dt
 
-            # 在接戰距離內 → 獎勵
             if cur_dist < ENGAGE_RANGE:
-                r += W_IN_RANGE
+                r += W_IN_RANGE_PS * dt
+            else:
+                r += W_COWARD_PS * dt                      # 龜縮懲罰
 
-            # 面向 boss → 獎勵
             bdx = cur.get("bdx", 0.0)
             facing = cur.get("facing", 1)
             if (bdx >= 0 and facing > 0) or (bdx < 0 and facing < 0):
-                r += W_FACE_BOSS
+                r += W_FACE_BOSS_PS * dt
 
-    return r
+    return r, step_hurt_penalty
