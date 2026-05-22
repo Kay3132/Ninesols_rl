@@ -35,6 +35,12 @@ W_COWARD_PS       = -0.6  # 每秒：龜縮（遠離戰區）懲罰
 W_APPROACH     = 0.02     # 每拉近 1 單位（位移型，天生與步數無關，不乘 dt）
 ENGAGE_RANGE   = 200.0    # 視為「接戰距離」
 
+# 一次性接戰 bonus（實際在 env.py 套用，因為需要 per-episode 狀態）。
+# boss 未出現時所有接戰 instrumental 都被 if boss_present 擋掉，那段只剩
+# 沒有方向性的時間懲罰。給「本局首次 boss 出現」一筆一次性獎勵，當作
+# 「去把 boss 觸發出來」的錨點。一次性 → 不會被 boss 偵測 flicker 刷分。
+W_BOSS_ENGAGED = 15.0
+
 def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_instrumental: bool = True) -> tuple[float, float]:
     r = 0.0
     step_hurt_penalty = 0.0  # 記錄這一步實際扣了多少分

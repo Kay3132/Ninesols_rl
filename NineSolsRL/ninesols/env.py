@@ -12,7 +12,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from .bridge import GameBridge
-from .rewards import compute_reward
+from .rewards import compute_reward, W_BOSS_ENGAGED
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -49,6 +49,7 @@ class NineSolsEnv(gym.Env):
         self._steps = 0
         self._prev_raw: dict | None = None
         self.cumulative_hurt = 0.0  # 記錄單局總扣血懲罰
+        self._boss_engaged = False  # 本局是否已首次接戰 boss（一次性 bonus 用）
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -119,6 +120,7 @@ class NineSolsEnv(gym.Env):
             self.bridge.send_action({"move": 0, "boss_hp_scale": self._boss_hp_scale})
 
         self.cumulative_hurt = 0.0  # 每次重置遊戲時歸零
+        self._boss_engaged = False  # 接戰旗標每局歸零
         self._prev_raw = s
         # 診斷：boss 起始 HP vs 未縮放滿血。ratio 應 ≈ scale（若縮放生效）
         _bhp = s.get("bhp", 0.0)
@@ -141,6 +143,12 @@ class NineSolsEnv(gym.Env):
         # 更新累計懲罰
         self.cumulative_hurt += step_hurt_penalty
 
+        # 一次性：本局首次讓 boss 出現/接戰 → 給接戰 bonus
+        if s.get("boss_present") and not self._boss_engaged:
+            reward += W_BOSS_ENGAGED
+            self._boss_engaged = True
+            print(f"[engage] step={self._steps} 首次接戰 boss (+{W_BOSS_ENGAGED:.0f})")
+
         terminated = bool(s.get("done", False))
         truncated = self._steps >= self.max_steps
         self._prev_raw = s
@@ -154,6 +162,7 @@ class NineSolsEnv(gym.Env):
             wr = sum(self._recent_outcomes) / n if n else 0.0
             print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
                   f"{'WIN' if won else 'lose'} steps={self._steps} "
+                  f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
                   f"| 近{n}場勝率 {wr:.0%}")
 
         return (self._encode_obs(s), reward, terminated, truncated,

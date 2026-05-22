@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.11.1")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.13.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -30,6 +30,9 @@ namespace NineSolsRL
 
         // curriculum：boss 有效 HP 壓到 _bossHpScale × maxHP（1.0 = 不弱化）
         private float _bossHpScale = 1.0f;
+
+        // 診斷：上次 boss 偵測結果（給 [RL] log 用）
+        private string _lastBossInfo = "none";
 
         // 格檔：_lastParryResult 0 無 / 1 不精確 / 2 精確；_parryCount 累計成功格檔次數（reward 用）
         private int _lastParryResult = 0;
@@ -261,7 +264,8 @@ namespace NineSolsRL
                 Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
                                $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
                                $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
-                               $"heal={_healPulse} bossHpScale={_bossHpScale:F2} state={st}");
+                               $"heal={_healPulse} bossHpScale={_bossHpScale:F2} " +
+                               $"boss={_lastBossInfo} state={st}");
             }
         }
 
@@ -344,19 +348,39 @@ namespace NineSolsRL
                 }
                 catch { }
 
-                // ---- boss：挑等級最高的怪（避免抓到召喚的小怪）----
+                // ---- boss 偵測 ----
                 float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0, bhpMax = 0;
                 int bossFsm = 0;
-                bool bossPresent = false, bWindup = false, bAttacking = false;
+                bool bossPresent = false, bWindup = false, bAttacking = false, bossDead = false;
+
+                // 主要：遊戲權威的「當前 boss 血條」→ PostureSystem → MonsterBase
                 MonsterBase boss = null;
-                int bestLevel = int.MinValue;
-                foreach (var m in FindObjectsOfType<MonsterBase>())
+                string bossSrc = "none";
+                try
                 {
-                    if (m == null) continue;
-                    int lvl = 0;
-                    try { lvl = (int)m.monsterStat.monsterLevel; } catch { }
-                    if (lvl > bestLevel) { bestLevel = lvl; boss = m; }
+                    var hpUI = GameCore.Instance != null ? GameCore.Instance.monsterHpUI : null;
+                    var bossHpUI = hpUI != null ? hpUI.CurrentBossHP : null;
+                    if (bossHpUI != null && bossHpUI.bindingPosture != null)
+                    {
+                        boss = bossHpUI.bindingPosture.BindMonster;
+                        if (boss != null) bossSrc = "ui";
+                    }
                 }
+                catch { }
+                // 後備：UI 沒給 boss 血條 → 掃場上等級最高的怪
+                if (boss == null)
+                {
+                    int bestLevel = int.MinValue;
+                    foreach (var m in FindObjectsOfType<MonsterBase>())
+                    {
+                        if (m == null) continue;
+                        int lvl = 0;
+                        try { lvl = (int)m.monsterStat.monsterLevel; } catch { }
+                        if (lvl > bestLevel) { bestLevel = lvl; boss = m; }
+                    }
+                    if (boss != null) bossSrc = "scan";
+                }
+                _lastBossInfo = boss != null ? boss.name + "(" + bossSrc + ")" : "none";
                 if (boss != null)
                 {
                     bx = boss.transform.position.x;
@@ -365,15 +389,19 @@ namespace NineSolsRL
                     try { bFacing = boss.Facing == Facings.Right ? 1f : -1f; } catch { }
                     try
                     {
-                        // curriculum：把 boss 有效 HP 壓到 cap = scale × maxHP
-                        float maxHp = boss.health.maxHealth.Value;
-                        bhpMax = maxHp;                              // 未縮放滿血（診斷用）
+                        // boss 真實血量 = PostureSystem（架勢系統），不是 MonsterBase.health
+                        var ps = boss.postureSystem;
+                        float maxHp = ps.MaxPostureValue;
+                        bhpMax = maxHp;                              // 未縮放滿血
                         float cap = _bossHpScale * maxHp;
-                        if (_bossHpScale < 1f && boss.health.currentValue > cap)
-                            boss.health.currentValue = cap;
-                        bhp = boss.health.currentValue;
+                        // curriculum：把 posture 壓到 cap = scale × maxHP
+                        if (_bossHpScale < 1f && ps.PostureValue > cap)
+                            ps.SetPostureValue((int)cap);
+                        float remain = ps.RemainTotal;               // posture + 內傷 = 目前血量
+                        bhp = remain;
                         // bhp_pct 相對於 cap 回報 → 不論難度 boss 都「從 100% 開始」
-                        bhpPct = cap > 0f ? Mathf.Clamp01(bhp / cap) : 0f;
+                        bhpPct = cap > 0f ? Mathf.Clamp01(remain / cap) : 0f;
+                        bossDead = remain <= 0f;
                     }
                     catch { }
                     // 粗粒度 FSM 狀態：AttackPrepose* = 攻擊前置(預警)、Attack* = 攻擊中
@@ -391,7 +419,7 @@ namespace NineSolsRL
                 float bdx = bossPresent ? bx - px : 0f;          // 相對位置
                 float bdy = bossPresent ? by - py : 0f;
 
-                bool done = (php <= 0) || (bossPresent && bhp <= 0);
+                bool done = (php <= 0) || bossDead;
                 bool controllable = IsPlayerControllable(player);
                 bool knockedDown  = IsHurtOrDown(player);   // 受傷/倒地（可用閃避起身）
                 string state = player.CurrentStateType.ToString();
