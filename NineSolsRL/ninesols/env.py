@@ -12,7 +12,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from .bridge import GameBridge
-from .rewards import compute_reward, W_BOSS_ENGAGED, W_TRUNCATION
+from .rewards import compute_reward, W_BOSS_ENGAGED, W_TRUNCATION, BURST_WINDOW_STEPS, W_BURST_PENALTY
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -66,6 +66,10 @@ class NineSolsEnv(gym.Env):
         self._boss_engaged = False  # 本局是否已首次接戰 boss（一次性 bonus 用）
         self._milestones_hit: set = set()  # 本階段已觸發的 bhp_pct 門檻（phase change 會重設）
         self._effective_max_steps = max_steps  # v1.20: 本 episode 有效上限（reset 時依 curriculum 調整）
+        self._last_hit_step = -999  # v1.20.1: 上次挨打的 step（burst penalty 用）
+        # v1.20.1: train.py 啟動時的首次 reset() 會 Suicide() 一次當「測試」，
+        # 之後跑出的第一個 episode 不計入 curriculum stats（避免初始設置狀態污染學習）
+        self._first_episode_done = False
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -146,6 +150,7 @@ class NineSolsEnv(gym.Env):
 
         self.cumulative_hurt = 0.0  # 每次重置遊戲時歸零
         self._milestones_hit = set()  # 里程碑門檻歸零（新 episode + phase 1）
+        self._last_hit_step = -999  # v1.20.1: burst penalty 狀態歸零
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
         self._boss_engaged = bool(s.get("boss_present"))
         self._prev_raw = s
@@ -175,6 +180,15 @@ class NineSolsEnv(gym.Env):
 
         # 更新累計懲罰
         self.cumulative_hurt += step_hurt_penalty
+
+        # v1.20.1: burst damage penalty —— 短時間內連續挨打額外扣分（不進 hurt-cap）
+        # 解 W_MAX_HURT_PENALTY 上限後致命一擊沒訊號的問題（phase 2 close-out 死亡）
+        if self._prev_raw is not None:
+            dphp = s.get("php_pct", 1.0) - self._prev_raw.get("php_pct", 1.0)
+            if dphp < 0:  # 這幀挨打
+                if self._steps - self._last_hit_step < BURST_WINDOW_STEPS:
+                    reward -= W_BURST_PENALTY
+                self._last_hit_step = self._steps
 
         # 一次性：本局首次讓 boss 出現/接戰 → 給接戰 bonus
         if s.get("boss_present") and not self._boss_engaged:
@@ -212,13 +226,22 @@ class NineSolsEnv(gym.Env):
         # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）
         if terminated or truncated:
             won = bool(terminated and s.get("boss_dead"))
-            self._recent_outcomes.append(won)
-            n = len(self._recent_outcomes)
-            wr = sum(self._recent_outcomes) / n if n else 0.0
-            print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
-                  f"{'WIN' if won else 'lose'} steps={self._steps} "
-                  f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
-                  f"| 近{n}場勝率 {wr:.0%}")
+            if not self._first_episode_done:
+                # v1.20.1: 首次 episode 是 train.py 啟動 Suicide 後的「測試 episode」，
+                # 不計入 curriculum stats 避免初始狀態污染學習
+                self._first_episode_done = True
+                print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
+                      f"{'WIN' if won else 'lose'} steps={self._steps} "
+                      f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
+                      f"| [首次 episode, 不計入 curriculum]")
+            else:
+                self._recent_outcomes.append(won)
+                n = len(self._recent_outcomes)
+                wr = sum(self._recent_outcomes) / n if n else 0.0
+                print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
+                      f"{'WIN' if won else 'lose'} steps={self._steps} "
+                      f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
+                      f"| 近{n}場勝率 {wr:.0%}")
 
         return (self._encode_obs(s), reward, terminated, truncated,
                 {"raw": s, "boss_hp_scale": self._boss_hp_scale})
