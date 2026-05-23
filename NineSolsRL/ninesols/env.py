@@ -28,6 +28,20 @@ CURRICULUM_STEP     = 0.15
 CURRICULUM_WINDOW   = 20
 CURRICULUM_WIN_RATE = 0.60
 
+# v1.19.0: Boss HP 里程碑 reward —— 每階段獨立追蹤。
+# 用途：在 episode 中段塞 outcome-correlated 訊號，補 gamma=0.98 horizon (~4s) 太短、
+# WIN 訊號傳不到 episode 中段的問題。
+# 注意 bhp_pct 是「對當前 curriculum cap 取比例」(mod 端 remain/cap)，所以 0.75/0.5/0.25
+# 在任何 curriculum scale 下都代表「此階段血條剩餘 75%/50%/25%」，跨難度行為一致。
+# 多階段 boss 用 PHASE_CHANGE_DELTA 偵測新血條 → 重設 _milestones_hit、下一階段重新累積。
+MILESTONES = [
+    (0.75, 15.0),    # 開始造成傷害
+    (0.50, 25.0),    # 半血線
+    (0.25, 40.0),    # 殘血線
+    (0.001, 60.0),   # 此階段架勢清零（鼓勵 push 過 phase transition）
+]
+PHASE_CHANGE_DELTA = 0.5  # bhp_pct 一步上升 > 此值 → 視為 phase change (0→1 躍升)
+
 
 class NineSolsEnv(gym.Env):
     metadata = {"render_modes": []}
@@ -50,6 +64,7 @@ class NineSolsEnv(gym.Env):
         self._prev_raw: dict | None = None
         self.cumulative_hurt = 0.0  # 記錄單局總扣血懲罰
         self._boss_engaged = False  # 本局是否已首次接戰 boss（一次性 bonus 用）
+        self._milestones_hit: set = set()  # 本階段已觸發的 bhp_pct 門檻（phase change 會重設）
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -111,28 +126,40 @@ class NineSolsEnv(gym.Env):
         # curriculum：上一批 episode 勝率達標 → 提升難度
         self._maybe_advance_curriculum()
 
-        # 等到玩家重生完成且可操作
+        # 要求 mod 重置：呼叫 Player.Suicide() → memory mode 死亡會自動重啟此場 boss 戰
+        self.bridge.send_action({"reset": True, "boss_hp_scale": self._boss_hp_scale})
+
+        # 等死亡 + 戰鬥重啟完成、玩家可操作且存活
+        # （mod 在 reset 後 3 秒內強制 controllable=false → reset 迴圈不會在死亡前提早 break）
         while True:
             s = self.bridge.recv_state()
             if s.get("controllable") and s.get("php", 0) > 0 and not s.get("done"):
                 break
-            # 死亡/過場中：保持停止；boss_hp_scale 一起送讓 mod 知道當前難度
+            # 死亡/重啟過場中：保持停止；boss_hp_scale 一起送讓 mod 知道當前難度
             self.bridge.send_action({"move": 0, "boss_hp_scale": self._boss_hp_scale})
 
         self.cumulative_hurt = 0.0  # 每次重置遊戲時歸零
-        self._boss_engaged = False  # 接戰旗標每局歸零
+        self._milestones_hit = set()  # 里程碑門檻歸零（新 episode + phase 1）
+        # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
+        self._boss_engaged = bool(s.get("boss_present"))
         self._prev_raw = s
         # 診斷：boss 起始 HP vs 未縮放滿血。ratio 應 ≈ scale（若縮放生效）
         _bhp = s.get("bhp", 0.0)
         _bmax = s.get("bhp_max", 0.0)
         _ratio = (_bhp / _bmax) if _bmax > 0 else 0.0
-        print(f"[ep-start] scale={self._boss_hp_scale:.2f} | "
-              f"boss bhp={_bhp:.0f}/{_bmax:.0f} (ratio={_ratio:.2f})")
+        print(f"[ep-start] Boss_HP_Scale={self._boss_hp_scale:.0%}")
         return self._encode_obs(s), {"raw": s, "boss_hp_scale": self._boss_hp_scale}
 
     def step(self, action):
         act = self._decode_action(action)
         act["boss_hp_scale"] = self._boss_hp_scale   # 側通道：告訴 mod 當前 curriculum 難度
+
+        # 接戰前禁用消耗性資源動作：長程(ammo)/喝藥(potion) 都是有限數量且不在 obs 裡，
+        # boss 戰前的長游走會把它們耗光。用 sticky 的 _boss_engaged（非即時 boss_present）
+        # → boss 偵測 flicker 免疫，一旦接戰過就永久解除、戰鬥中絕不誤擋。
+        if not self._boss_engaged and act["attack"] in (2, 5):
+            act["attack"] = 0
+
         self.bridge.send_action(act)
         s = self.bridge.recv_state()
         self._steps += 1
@@ -147,16 +174,35 @@ class NineSolsEnv(gym.Env):
         if s.get("boss_present") and not self._boss_engaged:
             reward += W_BOSS_ENGAGED
             self._boss_engaged = True
-            print(f"[engage] step={self._steps} 首次接戰 boss (+{W_BOSS_ENGAGED:.0f})")
+            #print(f"[engage] step={self._steps} 首次接戰 boss (+{W_BOSS_ENGAGED:.0f})")
+
+        # v1.19.0: Boss HP 里程碑（per-phase，farming-proof）
+        # 中段 outcome-correlated reward → 補 gamma=0.98 horizon 太短的 win 訊號傳遞問題
+        if (self._prev_raw is not None and s.get("boss_present")
+                and self._prev_raw.get("boss_present")):
+            prev_bhp = self._prev_raw.get("bhp_pct", 1.0)
+            cur_bhp  = s.get("bhp_pct", 1.0)
+            # Phase change 偵測：清零後新的滿血條（bhp_pct 0→1 躍升）→ 重設讓下一階段
+            # 重新累積里程碑（每階段獨立 ~+140 outcome 訊號）。boss 自癒幅度小、不會誤觸發。
+            if cur_bhp - prev_bhp > PHASE_CHANGE_DELTA and self._milestones_hit:
+                print(f"[milestone] step={self._steps} phase change "
+                      f"(bhp_pct {prev_bhp:.2f}→{cur_bhp:.2f}) 里程碑重設")
+                self._milestones_hit.clear()
+            # 觸發跨越本階段門檻的里程碑（一步可能跨多個）
+            for threshold, bonus in MILESTONES:
+                if (threshold not in self._milestones_hit
+                        and prev_bhp >= threshold > cur_bhp):
+                    reward += bonus
+                    self._milestones_hit.add(threshold)
+                    print(f"[milestone] step={self._steps} bhp<{threshold:.2f} (+{bonus:.0f})")
 
         terminated = bool(s.get("done", False))
         truncated = self._steps >= self.max_steps
         self._prev_raw = s
 
-        # episode 結束 → 記錄勝負給 curriculum（勝 = boss 被打死）
+        # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）
         if terminated or truncated:
-            won = bool(terminated and s.get("boss_present")
-                       and s.get("bhp", 1.0) <= 0)
+            won = bool(terminated and s.get("boss_dead"))
             self._recent_outcomes.append(won)
             n = len(self._recent_outcomes)
             wr = sum(self._recent_outcomes) / n if n else 0.0

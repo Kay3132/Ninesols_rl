@@ -10,23 +10,27 @@ rewards.py —— 三層 reward（參考 Hollow Knight RL 論文）
 
 # ---- 權重----
 # 壓縮極端值，將 Base/Sub 與 Instrumental 的落差控制在 100 倍以內。
-W_WIN          = 50.0     # 擊敗 boss (降維，交給 PPO 的 gamma 折扣去累積)
+W_WIN          = 50.0     # 擊敗 boss (clip_reward=10 已是上限，加大無效)
 W_DEATH        = 20.0     # 玩家死亡 (降維)
-W_BOSS_HURT    = 50.0     # boss 每損失 1.0 血量比例
+W_BOSS_HURT    = 100.0    # boss 每損失 1.0 血量比例（v1.19.0: 50→100，加重 damage 訊號）
 W_PLAYER_HURT  = 20.0     # 玩家每損失 1.0 血量比例 (早期調低，讓它敢換血)
 
 W_MAX_HURT_PENALTY = 20.0  # 設置單局扣血懲罰上限 (剛好等於一條滿血的懲罰量)
 
-W_PARRY_PRECISE   = 5.0   # 精確格檔
-W_PARRY_IMPRECISE = 1.0   # 不精確格檔
+W_PARRY_PRECISE   = 20.0  # 精確格檔（v1.18.0: 5→20，格檔是稀有事件，單次給足夠分量）
+W_PARRY_IMPRECISE = 5.0   # 不精確格檔（v1.18.0: 1→5）
+
+# v1.18.0 防禦引導（v1.19.0: evade 8→2，降 per-second 主導性）
+W_EVADE_PS               = 2.0   # 每秒：boss 在 windup/attacking 且玩家在 range 內、這幀沒挨打 → 加分
+W_PUNISH_HIT_DURING_WINDUP = 5.0  # 一次性：boss 有 windup 預警你還挨打 → 額外扣分（獨立於 hurt-cap）
 
 # --- instrumental：per-step 項一律改「每秒速率」，compute_reward 內乘 dt ---
 # 為什麼改 dt-based：原本「每步固定值」在遊戲加速 / fps 抖動時，「每秒幾步」
 # 會變 → 每秒拿到的 reward 跟著漂。改成「每秒速率 × dt」後不管 1×/2× 加速、
 # fps 怎麼抖，每「遊戲秒」拿到的 reward 都一樣 → 加速訓練→1× 跑可完美銜接。
 W_TIME_PENALTY_PS = -0.3  # 每秒：時間懲罰（原 -0.01/步 @30Hz）
-W_IN_RANGE_PS     = 3.0   # 每秒：處於接戰距離內
-W_FACE_BOSS_PS    = 1.5   # 每秒：面向 boss
+W_IN_RANGE_PS     = 1.0   # 每秒：處於接戰距離內（v1.19.0: 3→1，降 per-second 主導性）
+W_FACE_BOSS_PS    = 0.5   # 每秒：面向 boss（v1.19.0: 1.5→0.5）
 # W_COWARD 從原 -0.2/步(=-6/秒) 大幅調小：原值太大時，「衝過去送死」會比
 # 「在遠處龜縮」總分更高 → agent 學會自殺。接戰動力應來自「打到 boss 的大獎勵」，
 # 而不是「龜縮被重罰」。
@@ -46,11 +50,12 @@ def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_ins
     step_hurt_penalty = 0.0  # 記錄這一步實際扣了多少分
 
     # ---- base：勝負 ----
+    # boss_dead 優先：2 階段 boss 真死才算 win（換階段不會觸發）；與 env 的 won 一致
     if cur.get("done"):
-        if cur.get("php", 1) <= 0:
-            r -= W_DEATH
-        elif cur.get("boss_present") and cur.get("bhp", 1) <= 0:
+        if cur.get("boss_dead"):
             r += W_WIN
+        elif cur.get("php", 1) <= 0:
+            r -= W_DEATH
 
     # ---- sub：血量變化 ----
     if prev is not None:
@@ -78,6 +83,21 @@ def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_ins
                 r += W_PARRY_PRECISE                      # 精確格檔
             elif pr == 1:
                 r += W_PARRY_IMPRECISE                    # 不精確格檔
+
+        # v1.18.0 防禦引導
+        # 「躲過 boss 攻擊」：boss 構成威脅（windup 或攻擊中）、玩家在接戰範圍內、這幀沒挨打 → +分
+        # 用 prev 的 threat 訊號（避免本幀 transition 邊界誤判）；用 boolean 條件，不開新差分項
+        boss_threat = prev.get("boss_attacking") or prev.get("boss_windup")
+        in_range    = abs(prev.get("bdx", 1e9)) < ENGAGE_RANGE
+        got_hit     = dphp < 0
+        if boss_threat and in_range and not got_hit:
+            dt = cur.get("dt", 1.0 / 30.0)
+            dt = min(max(dt, 0.0), 0.2)
+            r += W_EVADE_PS * dt
+
+        # 「被預警攻擊命中」：boss 有 windup 預警你還挨打 → 額外扣分（獨立 stream，不進 hurt-cap）
+        if prev.get("boss_windup") and got_hit:
+            r -= W_PUNISH_HIT_DURING_WINDUP
 
     # ---- instrumental：時間懲罰 + 引導接戰（per-step 項乘 dt）----
     if use_instrumental:

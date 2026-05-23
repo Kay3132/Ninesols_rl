@@ -9,7 +9,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.13.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.17.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -30,6 +30,9 @@ namespace NineSolsRL
 
         // curriculum：boss 有效 HP 壓到 _bossHpScale × maxHP（1.0 = 不弱化）
         private float _bossHpScale = 1.0f;
+
+        // hard reset：呼叫 Player.Suicide() → memory mode 下死亡會自動重啟此場 boss 戰
+        private float _lastResetTime = 0f;
 
         // 診斷：上次 boss 偵測結果（給 [RL] log 用）
         private string _lastBossInfo = "none";
@@ -401,7 +404,6 @@ namespace NineSolsRL
                         bhp = remain;
                         // bhp_pct 相對於 cap 回報 → 不論難度 boss 都「從 100% 開始」
                         bhpPct = cap > 0f ? Mathf.Clamp01(remain / cap) : 0f;
-                        bossDead = remain <= 0f;
                     }
                     catch { }
                     // 粗粒度 FSM 狀態：AttackPrepose* = 攻擊前置(預警)、Attack* = 攻擊中
@@ -414,13 +416,20 @@ namespace NineSolsRL
                         bAttacking = csName.StartsWith("Attack") && !bWindup && !csName.Contains("Parrying");
                     }
                     catch { }
+                    // 真死才 true；換階段 (BossPhaseChangeState) 時 IsDead() 為 false
+                    // → 2 階段 boss 不會在一階清掉時誤判 done
+                    try { bossDead = boss.IsDead(); }
+                    catch { }
                     bossPresent = true;
                 }
                 float bdx = bossPresent ? bx - px : 0f;          // 相對位置
                 float bdy = bossPresent ? by - py : 0f;
 
                 bool done = (php <= 0) || bossDead;
-                bool controllable = IsPlayerControllable(player);
+                // reset 後 3 秒內強制 controllable=false → 確保 Python reset 迴圈會等
+                // 完整個場景重載（fade + load + 進場動畫），不會在舊場景提早 break
+                bool controllable = IsPlayerControllable(player)
+                                    && (Time.time - _lastResetTime > 3f);
                 bool knockedDown  = IsHurtOrDown(player);   // 受傷/倒地（可用閃避起身）
                 string state = player.CurrentStateType.ToString();
 
@@ -431,6 +440,7 @@ namespace NineSolsRL
                     $"\"qi\":{qi},\"qi_max\":{qiMax},\"qi_pct\":{qiPct}," +
                     $"\"last_parry_result\":{_lastParryResult},\"parry_count\":{_parryCount}," +
                     $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
+                    $"\"boss_name\":\"{(boss != null ? boss.name : "")}\"," +
                     $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
                     $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
                     $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct},\"bhp_max\":{bhpMax}," +
@@ -441,6 +451,7 @@ namespace NineSolsRL
                     $"\"knocked_down\":{(knockedDown ? "true" : "false")}," +
                     $"\"dt\":{dt}," +
                     $"\"state\":\"{state}\"," +
+                    $"\"boss_dead\":{(bossDead ? "true" : "false")}," +
                     $"\"done\":{(done ? "true" : "false")}" +
                     "}\n";
             }
@@ -470,6 +481,13 @@ namespace NineSolsRL
                 int last = json.LastIndexOf('{');
                 if (last > 0) json = json.Substring(last);
 
+                // reset 指令：要求重載 JieChuan 挑戰（確定性 episode reset）
+                if (json.Replace(" ", "").Contains("\"reset\":true"))
+                {
+                    DoHardReset();
+                    return;
+                }
+
                 // move: 0 停 / 1 左 / 2 右
                 int move = ExtractInt(json, "move");
                 _moveDir = move == 1 ? -1 : move == 2 ? 1 : 0;
@@ -491,6 +509,22 @@ namespace NineSolsRL
                 _bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
             }
             catch { }
+        }
+
+        // hard reset：呼叫 Player.Suicide()（= 暫停選單「重置挑戰」按鈕本體）。
+        // memory mode 下玩家死亡 → 遊戲自動重啟此場 boss 戰。截斷/敗/勝皆適用。
+        private void DoHardReset()
+        {
+            if (Time.time - _lastResetTime < 3f) return;   // 去抖：避免短時間重複觸發
+            _lastResetTime = Time.time;
+            _moveDir = 0;
+            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = _healPulse = 0;
+            try
+            {
+                Player.i.Suicide();   // health=-1 + DeadCheck，硬殺、繞過無敵
+                Logger.LogInfo("[reset] Player.Suicide() → 重啟記憶戰鬥");
+            }
+            catch (Exception e) { Logger.LogError("[reset] " + e); }
         }
 
         private static int ExtractInt(string json, string key)

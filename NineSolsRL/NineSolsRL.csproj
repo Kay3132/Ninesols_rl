@@ -35,5 +35,8 @@
     <Reference Include="0Harmony">
       <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\BepInEx\core\0Harmony.dll</HintPath>
     </Reference>
+    <Reference Include="UniTask">
+      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UniTask.dll</HintPath>
+    </Reference>
   </ItemGroup>
 </Project>
