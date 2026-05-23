@@ -12,7 +12,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from .bridge import GameBridge
-from .rewards import compute_reward, W_BOSS_ENGAGED
+from .rewards import compute_reward, W_BOSS_ENGAGED, W_TRUNCATION
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -65,6 +65,7 @@ class NineSolsEnv(gym.Env):
         self.cumulative_hurt = 0.0  # 記錄單局總扣血懲罰
         self._boss_engaged = False  # 本局是否已首次接戰 boss（一次性 bonus 用）
         self._milestones_hit: set = set()  # 本階段已觸發的 bhp_pct 門檻（phase change 會重設）
+        self._effective_max_steps = max_steps  # v1.20: 本 episode 有效上限（reset 時依 curriculum 調整）
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -125,6 +126,11 @@ class NineSolsEnv(gym.Env):
 
         # curriculum：上一批 episode 勝率達標 → 提升難度
         self._maybe_advance_curriculum()
+
+        # v1.20: max_steps 隨 curriculum 等比放大，讓 truncation 永遠 = 真失敗，
+        # 不會在 scale 升高後因為「時間天花板太低」誤罰認真打的 agent。
+        # scale=0.10: 2800 (~93s)、scale=0.50: 6000 (~200s)、scale=1.00: 10000 (~333s)
+        self._effective_max_steps = int(self.max_steps * (1.0 + 4.0 * self._boss_hp_scale))
 
         # 要求 mod 重置：呼叫 Player.Suicide() → memory mode 死亡會自動重啟此場 boss 戰
         self.bridge.send_action({"reset": True, "boss_hp_scale": self._boss_hp_scale})
@@ -197,7 +203,10 @@ class NineSolsEnv(gym.Env):
                     print(f"[milestone] step={self._steps} bhp<{threshold:.2f} (+{bonus:.0f})")
 
         terminated = bool(s.get("done", False))
-        truncated = self._steps >= self.max_steps
+        truncated = self._steps >= self._effective_max_steps
+        # v1.20: 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間到 truncation 免死亡懲罰」exploit
+        if truncated and not terminated:
+            reward -= W_TRUNCATION
         self._prev_raw = s
 
         # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）

@@ -14,6 +14,7 @@ W_WIN          = 50.0     # 擊敗 boss (clip_reward=10 已是上限，加大無
 W_DEATH        = 20.0     # 玩家死亡 (降維)
 W_BOSS_HURT    = 100.0    # boss 每損失 1.0 血量比例（v1.19.0: 50→100，加重 damage 訊號）
 W_PLAYER_HURT  = 20.0     # 玩家每損失 1.0 血量比例 (早期調低，讓它敢換血)
+W_TRUNCATION   = 100.0    # v1.20.0: episode 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間 exploit」
 
 W_MAX_HURT_PENALTY = 20.0  # 設置單局扣血懲罰上限 (剛好等於一條滿血的懲罰量)
 
