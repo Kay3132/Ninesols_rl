@@ -244,7 +244,8 @@ class NineSolsEnv(gym.Env):
                       f"| 近{n}場勝率 {wr:.0%}")
 
         return (self._encode_obs(s), reward, terminated, truncated,
-                {"raw": s, "boss_hp_scale": self._boss_hp_scale})
+                {"raw": s, "boss_hp_scale": self._boss_hp_scale,
+                 "raw_reward": float(reward)})  # SIL recorder 抓未 normalize 的 reward
 
     def close(self):
         self.bridge.close()
