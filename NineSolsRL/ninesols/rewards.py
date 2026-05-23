@@ -13,16 +13,22 @@ rewards.py —— 三層 reward（參考 Hollow Knight RL 論文）
 W_WIN          = 50.0     # 擊敗 boss (clip_reward=10 已是上限，加大無效)
 W_DEATH        = 20.0     # 玩家死亡 (降維)
 W_BOSS_HURT    = 100.0    # boss 每損失 1.0 血量比例（v1.19.0: 50→100，加重 damage 訊號）
-W_PLAYER_HURT  = 20.0     # 玩家每損失 1.0 血量比例 (早期調低，讓它敢換血)
 W_TRUNCATION   = 100.0    # v1.20.0: episode 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間 exploit」
 
-# v1.20.1: burst damage penalty —— 短時間連續挨打(連段)額外懲罰，獨立 stream（不進 hurt-cap）
-# 動機：W_MAX_HURT_PENALTY=20 全局上限 → agent 取一條血等量後挨打 0 懲罰 → 致命一擊沒訊號。
-# 用「上次挨打 step 距離」偵測連段：1s 內二度挨 → 額外扣分。
+# v1.20.2: hurt penalty 改 quadratic（取代原 linear + W_MAX_HURT_PENALTY cap）
+# 動機：原 linear+cap 在「滿 cap 後被打死」情境下 reward = 0（phase 2 close-out 殞落）。
+# 改 quadratic 之後:
+#   - 小擊 (5%) = 0.4 點 (比舊 1.0 還輕 → 接戰退縮風險更低)
+#   - 中擊 (25%) = 9.4 點
+#   - 重擊 (50%) = 37.5 點（舊 cap=10）
+#   - 致命 (100%) = 150 點
+# 訊號連續、不需 cap、不需 cumulative_hurt 追蹤。burst penalty 仍保留抓 combo。
+W_PLAYER_HURT_Q = 150.0   # quadratic 係數,r -= W_PLAYER_HURT_Q * dphp^2
+
+# v1.20.1: burst damage penalty —— 短時間連續挨打(連段)額外懲罰，獨立 stream
+# quadratic 對「連 5 擊」跟「散 5 擊」給同樣分,burst 仍負責抓 combo 訊號
 BURST_WINDOW_STEPS = 30   # ~1s @30Hz
 W_BURST_PENALTY    = 10.0
-
-W_MAX_HURT_PENALTY = 20.0  # 設置單局扣血懲罰上限 (剛好等於一條滿血的懲罰量)
 
 W_PARRY_PRECISE   = 20.0  # 精確格檔（v1.18.0: 5→20，格檔是稀有事件，單次給足夠分量）
 W_PARRY_IMPRECISE = 5.0   # 不精確格檔（v1.18.0: 1→5）
@@ -52,9 +58,8 @@ ENGAGE_RANGE   = 200.0    # 視為「接戰距離」
 # 「去把 boss 觸發出來」的錨點。一次性 → 不會被 boss 偵測 flicker 刷分。
 W_BOSS_ENGAGED = 15.0
 
-def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_instrumental: bool = True) -> tuple[float, float]:
+def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) -> float:
     r = 0.0
-    step_hurt_penalty = 0.0  # 記錄這一步實際扣了多少分
 
     # ---- base：勝負 ----
     # boss_dead 優先：2 階段 boss 真死才算 win（換階段不會觸發）；與 env 的 won 一致
@@ -68,15 +73,11 @@ def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_ins
     if prev is not None:
         dphp = cur.get("php_pct", 1.0) - prev.get("php_pct", 1.0)
         if dphp < 0:
-            raw_penalty = (-dphp) * W_PLAYER_HURT
-            
-            # 【核心邏輯：計算剩餘的懲罰額度】
-            remaining_penalty_allowance = W_MAX_HURT_PENALTY - cumulative_hurt
-            if remaining_penalty_allowance > 0:
-                # 確保扣的分數不會超過剩餘額度
-                actual_penalty = min(raw_penalty, remaining_penalty_allowance)
-                r -= actual_penalty
-                step_hurt_penalty = actual_penalty  # 回傳給 env.py 去累加
+            # v1.20.2: quadratic hurt penalty (取代 linear+cap)
+            # dphp ∈ [-1, 0],平方後 ∈ [0, 1] → 自然 bounded、不需 cap
+            # 小擊輕、重擊飆,訊號連續可學「招式 A 比招式 B 危險」相對排序
+            r -= W_PLAYER_HURT_Q * dphp * dphp
+            # step_hurt_penalty 保持 0（簽章相容,env.py 累 0 無作用）
 
         if cur.get("boss_present") and prev.get("boss_present"):
             dbhp = cur.get("bhp_pct", 1.0) - prev.get("bhp_pct", 1.0)
@@ -135,4 +136,4 @@ def compute_reward(prev: dict | None, cur: dict, cumulative_hurt: float, use_ins
             if (bdx >= 0 and facing > 0) or (bdx < 0 and facing < 0):
                 r += W_FACE_BOSS_PS * dt
 
-    return r, step_hurt_penalty
+    return r

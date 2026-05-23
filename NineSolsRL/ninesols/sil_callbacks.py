@@ -37,9 +37,25 @@ class SILEpisodeRecorderCallback(BaseCallback):
         self._act_seq: list[np.ndarray] = []
         self._return_raw: float = 0.0
 
+        # 是 Suicide 後的「測試 episode」(前 ~90 步 controllable=false),不 flush
+        # 進 buffer,避免污染 SIL 學到「這些 obs 下任何 action 都 ok」
+        self._first_episode_done = False
+
     def _flush_episode(self, info: dict) -> None:
         if not self._obs_seq:
             return
+
+        # 首次 episode 直接清掉不 admit(對齊 env.py:226 的 curriculum 排除)
+        if not self._first_episode_done:
+            self._first_episode_done = True
+            if self.verbose >= 1:
+                print(f"[sil] 首次 episode 不入 buffer (len={len(self._obs_seq)} "
+                      f"ret={self._return_raw:.1f})")
+            self._obs_seq.clear()
+            self._act_seq.clear()
+            self._return_raw = 0.0
+            return
+
         raw = info.get("raw", {}) if isinstance(info, dict) else {}
         # WIN = boss 真死(2 階段全清)。truncation 不算贏。
         is_win = bool(raw.get("boss_dead", False)) \

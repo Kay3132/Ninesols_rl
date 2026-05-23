@@ -62,7 +62,7 @@ class NineSolsEnv(gym.Env):
 
         self._steps = 0
         self._prev_raw: dict | None = None
-        self.cumulative_hurt = 0.0  # 記錄單局總扣血懲罰
+        # v1.20.2: hurt penalty 改 quadratic 後不再需要 cumulative_hurt cap 追蹤
         self._boss_engaged = False  # 本局是否已首次接戰 boss（一次性 bonus 用）
         self._milestones_hit: set = set()  # 本階段已觸發的 bhp_pct 門檻（phase change 會重設）
         self._effective_max_steps = max_steps  # v1.20: 本 episode 有效上限（reset 時依 curriculum 調整）
@@ -148,7 +148,6 @@ class NineSolsEnv(gym.Env):
             # 死亡/重啟過場中：保持停止；boss_hp_scale 一起送讓 mod 知道當前難度
             self.bridge.send_action({"move": 0, "boss_hp_scale": self._boss_hp_scale})
 
-        self.cumulative_hurt = 0.0  # 每次重置遊戲時歸零
         self._milestones_hit = set()  # 里程碑門檻歸零（新 episode + phase 1）
         self._last_hit_step = -999  # v1.20.1: burst penalty 狀態歸零
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
@@ -175,11 +174,8 @@ class NineSolsEnv(gym.Env):
         s = self.bridge.recv_state()
         self._steps += 1
 
-        # 將 cumulative_hurt 傳入，並接收這回合實際產生的懲罰
-        reward, step_hurt_penalty = compute_reward(self._prev_raw, s, self.cumulative_hurt)
-
-        # 更新累計懲罰
-        self.cumulative_hurt += step_hurt_penalty
+        # v1.20.2: quadratic hurt penalty (取代 linear+cap),compute_reward 改單一回傳
+        reward = compute_reward(self._prev_raw, s)
 
         # v1.20.1: burst damage penalty —— 短時間內連續挨打額外扣分（不進 hurt-cap）
         # 解 W_MAX_HURT_PENALTY 上限後致命一擊沒訊號的問題（phase 2 close-out 死亡）
@@ -205,8 +201,9 @@ class NineSolsEnv(gym.Env):
             # Phase change 偵測：清零後新的滿血條（bhp_pct 0→1 躍升）→ 重設讓下一階段
             # 重新累積里程碑（每階段獨立 ~+140 outcome 訊號）。boss 自癒幅度小、不會誤觸發。
             if cur_bhp - prev_bhp > PHASE_CHANGE_DELTA and self._milestones_hit:
-                print(f"[milestone] step={self._steps} phase change "
-                      f"(bhp_pct {prev_bhp:.2f}→{cur_bhp:.2f}) 里程碑重設")
+                #print(f"[milestone] step={self._steps} phase change "
+                #      f"(bhp_pct {prev_bhp:.2f}→{cur_bhp:.2f}) 里程碑重設")
+                print(f"[milestone] step={self._steps} Phase change")
                 self._milestones_hit.clear()
             # 觸發跨越本階段門檻的里程碑（一步可能跨多個）
             for threshold, bonus in MILESTONES:
@@ -214,7 +211,7 @@ class NineSolsEnv(gym.Env):
                         and prev_bhp >= threshold > cur_bhp):
                     reward += bonus
                     self._milestones_hit.add(threshold)
-                    print(f"[milestone] step={self._steps} bhp<{threshold:.2f} (+{bonus:.0f})")
+                    #print(f"[milestone] step={self._steps} bhp<{threshold:.2f} (+{bonus:.0f})")
 
         terminated = bool(s.get("done", False))
         truncated = self._steps >= self._effective_max_steps
