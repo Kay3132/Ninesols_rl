@@ -176,6 +176,23 @@ class SILBuffer:
         ret = np.array([self._ret[i] for i in sel], dtype=np.float32)
         return obs, act, ret
 
+    def purge_non_wins(self) -> int:
+        """v1.21.1: curriculum advance 時呼叫 —— 砍掉所有非 WIN transitions,
+        保留 WIN(WIN 在任何難度下都是完整成功軌跡,對 phase 2 close-out 仍有價值)。
+
+        順便 clear `_recent_returns` —— 上一難度的 return 對新難度的 admit 判斷
+        無參考價值(雖然 reward shape 大致 invariant,episode 長度差異會讓 return
+        分佈漂)。回傳被砍掉的 transition 數量。
+        """
+        n_before = len(self._obs)
+        keep_idx = [i for i in range(n_before) if self._win[i]]
+        self._obs = [self._obs[i] for i in keep_idx]
+        self._act = [self._act[i] for i in keep_idx]
+        self._ret = [self._ret[i] for i in keep_idx]
+        self._win = [self._win[i] for i in keep_idx]
+        self._recent_returns.clear()
+        return n_before - len(self._obs)
+
     def stats(self) -> dict:
         return {
             "buffer_size": len(self._obs),

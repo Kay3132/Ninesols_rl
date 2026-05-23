@@ -41,6 +41,10 @@ class SILEpisodeRecorderCallback(BaseCallback):
         # 進 buffer,避免污染 SIL 學到「這些 obs 下任何 action 都 ok」
         self._first_episode_done = False
 
+        # v1.21.1: 監看 curriculum advance(env.py 改變 boss_hp_scale 時觸發
+        # buffer purge_non_wins + SIL coef decay)。None = 還沒收到第一個 info
+        self._last_scale: Optional[float] = None
+
     def _flush_episode(self, info: dict) -> None:
         if not self._obs_seq:
             return
@@ -103,6 +107,18 @@ class SILEpisodeRecorderCallback(BaseCallback):
             raise RuntimeError(f"unexpected action shape: {action.shape}")
 
         raw_r = float(info.get("raw_reward", 0.0))
+
+        # v1.21.1: 偵測 curriculum advance(env.py:_maybe_advance_curriculum 改了 scale)
+        scale = info.get("boss_hp_scale")
+        if scale is not None:
+            scale = float(scale)
+            if self._last_scale is None:
+                self._last_scale = scale
+            elif abs(scale - self._last_scale) > 1e-6:
+                # 通知 PPOSIL 做 buffer purge + coef decay(model = PPOSIL 實例)
+                if hasattr(self.model, "on_curriculum_advance"):
+                    self.model.on_curriculum_advance(self._last_scale, scale)
+                self._last_scale = scale
 
         self._obs_seq.append(obs_t)
         self._act_seq.append(action.copy())
