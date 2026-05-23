@@ -49,7 +49,7 @@ class NineSolsEnv(gym.Env):
     OBS_DIM = 19
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
-                 max_steps: int = 2000):
+                 max_steps: int = 1500):
         super().__init__()
         self.bridge = GameBridge(host, port)
         self.max_steps = max_steps
