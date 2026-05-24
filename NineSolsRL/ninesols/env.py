@@ -19,6 +19,12 @@ POS_SCALE = 1000.0   # 相對座標
 VEL_SCALE = 200.0    # 速度
 INJ_SCALE = 100.0    # 內傷
 
+# v2.0.0: boss 攻擊類別 one-hot 維度（取代 boss_windup/boss_attacking 兩個 boolean）
+# 8 個通用 category 在 Plugin.cs _bossFsmCategories 用同樣編號定義。
+# 0 idle / 1 parryable_windup / 2 unparryable_windup / 3 grab_windup
+# 4 ranged_windup / 5 attacking / 6 phase_change / 7 stunned
+N_ATTACK_CATEGORIES = 8
+
 # ---- curriculum：弱化 boss，讓「贏」變得可達 ----
 # boss 有效 HP = boss_hp_scale × maxHP。從 START 開始，最近 WINDOW 場勝率
 # ≥ WIN_RATE 就 +STEP，直到 MAX(1.0)。勝率不到就停在原難度（自我修正）。
@@ -46,7 +52,8 @@ PHASE_CHANGE_DELTA = 0.5  # bhp_pct 一步上升 > 此值 → 視為 phase chang
 class NineSolsEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    OBS_DIM = 19
+    # v2.0.0: 19 → 25(-2 boolean +8 one-hot)
+    OBS_DIM = 17 + N_ATTACK_CATEGORIES   # = 25
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
                  max_steps: int = 1500):
@@ -70,6 +77,10 @@ class NineSolsEnv(gym.Env):
         # v1.20.1: train.py 啟動時的首次 reset() 會 Suicide() 一次當「測試」，
         # 之後跑出的第一個 episode 不計入 curriculum stats（避免初始設置狀態污染學習）
         self._first_episode_done = False
+        # v2.0.0: 本 episode 已進入的 boss phase 數(reset=1,phase change 偵測時 +1)。
+        # SIL NEAR 判定用 phase_count >= total_phases 決定是否在最終階段。
+        self._phase_count = 1
+        self._episode_return = 0.0   # 累計 raw reward,ep-end log 用
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -77,6 +88,11 @@ class NineSolsEnv(gym.Env):
 
     # ---- 編解碼 ----
     def _encode_obs(self, s: dict) -> np.ndarray:
+        # v2.0.0: boss 攻擊類別 one-hot（取代舊的 boss_windup / boss_attacking 兩個 bit）
+        # 未知 boss / 未登錄 FSM → mod 端 fallback 到 0 (idle)，這裡夾範圍防呆。
+        cat = int(s.get("attack_category", 0))
+        cat = max(0, min(N_ATTACK_CATEGORIES - 1, cat))
+        cat_onehot = [1.0 if i == cat else 0.0 for i in range(N_ATTACK_CATEGORIES)]
         return np.array([
             s.get("vx", 0.0) / VEL_SCALE,
             s.get("vy", 0.0) / VEL_SCALE,
@@ -94,9 +110,8 @@ class NineSolsEnv(gym.Env):
             s.get("bhp_pct", 0.0),
             1.0 if s.get("controllable") else 0.0,
             s.get("last_parry_result", 0) / 2.0,    # 0 無 / 0.5 不精確 / 1 精確
-            1.0 if s.get("boss_windup") else 0.0,    # boss 攻擊前置（預警）
-            1.0 if s.get("boss_attacking") else 0.0, # boss 攻擊中
             1.0 if s.get("knocked_down") else 0.0,   # 玩家受傷/倒地（可用閃避起身）
+            *cat_onehot,                             # v2.0.0: 8 個通用 attack category one-hot
         ], dtype=np.float32)
 
     @staticmethod
@@ -150,6 +165,8 @@ class NineSolsEnv(gym.Env):
 
         self._milestones_hit = set()  # 里程碑門檻歸零（新 episode + phase 1）
         self._last_hit_step = -999  # v1.20.1: burst penalty 狀態歸零
+        self._phase_count = 1  # v2.0.0: 新 episode 從 phase 1 起算
+        self._episode_return = 0.0  # 累計 raw reward 歸零
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
         self._boss_engaged = bool(s.get("boss_present"))
         self._prev_raw = s
@@ -203,7 +220,8 @@ class NineSolsEnv(gym.Env):
             if cur_bhp - prev_bhp > PHASE_CHANGE_DELTA and self._milestones_hit:
                 #print(f"[milestone] step={self._steps} phase change "
                 #      f"(bhp_pct {prev_bhp:.2f}→{cur_bhp:.2f}) 里程碑重設")
-                print(f"[milestone] step={self._steps} Phase change")
+                self._phase_count += 1  # v2.0.0: SIL NEAR 判定要知道目前在第幾階段
+                print(f"[milestone] step={self._steps} Phase change → phase {self._phase_count}")
                 self._milestones_hit.clear()
             # 觸發跨越本階段門檻的里程碑（一步可能跨多個）
             for threshold, bonus in MILESTONES:
@@ -219,6 +237,7 @@ class NineSolsEnv(gym.Env):
         if truncated and not terminated:
             reward -= W_TRUNCATION
         self._prev_raw = s
+        self._episode_return += float(reward)  # 累計 raw reward,ep-end log 用
 
         # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）
         if terminated or truncated:
@@ -229,6 +248,7 @@ class NineSolsEnv(gym.Env):
                 self._first_episode_done = True
                 print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
                       f"{'WIN' if won else 'lose'} steps={self._steps} "
+                      f"ret={self._episode_return:.1f} "
                       f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
                       f"| [首次 episode, 不計入 curriculum]")
             else:
@@ -237,9 +257,13 @@ class NineSolsEnv(gym.Env):
                 wr = sum(self._recent_outcomes) / n if n else 0.0
                 print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
                       f"{'WIN' if won else 'lose'} steps={self._steps} "
+                      f"ret={self._episode_return:.1f} "
                       f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
                       f"| 近{n}場勝率 {wr:.0%}")
 
+        # v2.0.0: phase_count 是 env 端追蹤的,塞進 s 一起給 SIL recorder
+        # (total_phases 已由 mod 端 JSON 帶在 s 裡,不用額外注入)
+        s["phase_count"] = self._phase_count
         return (self._encode_obs(s), reward, terminated, truncated,
                 {"raw": s, "boss_hp_scale": self._boss_hp_scale,
                  "raw_reward": float(reward)})  # SIL recorder 抓未 normalize 的 reward

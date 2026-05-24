@@ -25,12 +25,14 @@ from .sil_buffer import SILBuffer
 class SILEpisodeRecorderCallback(BaseCallback):
     """單 env(DummyVecEnv num_envs=1)版本。"""
 
+    # v2.0.0 NEAR-WIN 判定門檻:final phase 殘血比例 < 此值 → 算 NEAR(scale-invariant)
+    # 舊版用絕對 HP=100,在 scale=0.10 時 phase 1 殘血會誤判 NEAR。
+    NEAR_WIN_BHP_PCT = 0.05
+
     def __init__(self, sil_buffer: SILBuffer,
-                 near_win_bhp: float = 100.0,
                  verbose: int = 0):
         super().__init__(verbose)
         self.buffer = sil_buffer
-        self.near_win_bhp = float(near_win_bhp)
 
         # per-episode 收集器
         self._obs_seq: list[np.ndarray] = []
@@ -61,11 +63,20 @@ class SILEpisodeRecorderCallback(BaseCallback):
             return
 
         raw = info.get("raw", {}) if isinstance(info, dict) else {}
-        # WIN = boss 真死(2 階段全清)。truncation 不算贏。
-        is_win = bool(raw.get("boss_dead", False)) \
-                 and not bool(info.get("TimeLimit.truncated", False))
-        bhp_end = float(raw.get("bhp", 1e9))
-        is_near_win = (not is_win) and (bhp_end < self.near_win_bhp)
+        is_truncated = bool(info.get("TimeLimit.truncated", False))
+        # WIN = boss 真死(N 階段全清)。truncation 不算贏。
+        is_win = bool(raw.get("boss_dead", False)) and not is_truncated
+        # v2.0.0 NEAR-WIN:必須三條件 AND
+        #   1. 非 WIN 且非 truncation(truncation 已被 W_TRUNCATION 罰,不該再 NEAR admit)
+        #   2. 已進入最終階段(N-phase 通用,phase_count >= total_phases)
+        #   3. 最終階段殘血比例 < NEAR_WIN_BHP_PCT(scale-invariant)
+        # 修了舊版用絕對 HP=100 在 scale=0.10 時 phase 1 殘血誤判 NEAR 的 bug。
+        phase_count  = int(raw.get("phase_count", 1))
+        total_phases = int(raw.get("total_phases", 1))
+        bhp_pct_end  = float(raw.get("bhp_pct", 1.0))
+        is_near_win = ((not is_win) and (not is_truncated)
+                       and phase_count >= total_phases
+                       and bhp_pct_end < self.NEAR_WIN_BHP_PCT)
 
         obs_arr = np.stack(self._obs_seq, axis=0).astype(np.float32)
         act_arr = np.stack(self._act_seq, axis=0).astype(np.int64)

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
@@ -9,7 +10,7 @@ using HarmonyLib;
 
 namespace NineSolsRL
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "1.17.0")]
+    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "2.0.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static Plugin Instance;
@@ -40,6 +41,63 @@ namespace NineSolsRL
         // 格檔：_lastParryResult 0 無 / 1 不精確 / 2 精確；_parryCount 累計成功格檔次數（reward 用）
         private int _lastParryResult = 0;
         private int _parryCount = 0;
+
+        // v2.0.0 dev flag：開著時每次 boss FSM 字串變動就印一行 [boss-fsm] log，
+        // 用來收集介川 / 黃裳等 boss 的所有招式 FSM 字串，整理後填到
+        // _bossFsmCategories 對映表。production build 應改回 false。
+        // 邊訓邊熱補策略：保留 true，訓練期間 grep log 抓新字串。
+        private const bool LOG_BOSS_FSM = true;
+        private string _lastLoggedBossFsm = null;
+
+        // v2.0.0 通用攻擊類別查表：每個 boss 一張 FSM 字串 → category 的表
+        // 8 個通用 category（boss-agnostic）：
+        //   0 idle / 1 parryable_windup / 2 unparryable_windup / 3 grab_windup
+        //   4 ranged_windup / 5 attacking / 6 phase_change / 7 stunned
+        // 未知 FSM fallback 到 0 (idle)。
+        // Key 用 Unity 物件全名（含 StealthGameMonster_Boss_ 前綴），匹配最直接零歧義。
+        private static readonly Dictionary<string, Dictionary<string, int>> _bossFsmCategories
+            = new Dictionary<string, Dictionary<string, int>>
+        {
+            ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
+            {
+                // category:0 idle / 1 parryable_windup / 5 attacking / 7 stunned
+                ["Attack1"]       = 5,  // attacking
+                ["Attack2"]       = 5,  // attacking
+                ["Attack3"]       = 5,  // attacking
+                ["Attack4"]       = 5,  // attacking
+                ["Attack5"]       = 5,  // attacking
+                ["Attack6"]       = 5,  // attacking
+                ["Attack7"]       = 5,  // attacking
+                ["Attack8"]       = 5,  // attacking
+                ["Attack9"]       = 5,  // attacking
+                ["Attack10"]      = 5,  // attacking
+                ["Attack11"]      = 5,  // attacking
+                ["Attack12"]      = 5,  // attacking
+                ["Attack13"]      = 5,  // attacking
+                ["Attack14"]      = 5,  // attacking
+                ["Engaging"]      = 0,  // idle:接近 / 走位
+                ["Hurt_Big"]      = 7,  // stunned:boss 被大傷硬直
+                ["PostureBreak"]  = 7,  // stunned:架勢崩潰,deathblow 機會 
+                ["PreAttack"]     = 1,  // parryable_windup:前置攻擊
+                ["TurnAround"]    = 0,  // idle:轉身
+                ["Undefined"]     = 0,  // idle:FSM 過渡(顯式登錄)
+                ["WanderingIdle"] = 0,  // idle:閒晃(顯式登錄)
+                // ---- TBD----
+                // ["BossAngry"] // 是否有無敵幀/紅光?選 0/1/6
+                // ["LastHit"]   // 中場狀態,語意未明
+            },
+            // 未來新 boss：加 entry。例：
+            // ["StealthGameMonster_Boss_HuangShang"] = new Dictionary<string, int> { ... },
+        };
+
+        // v2.0.0 每個 boss 的總階段數（NEAR 判定用：phase_count >= total_phases 才算最終階段）
+        // 未知 boss fallback 1（無 phase gating，等同單階段 boss）。
+        private static readonly Dictionary<string, int> _bossTotalPhases
+            = new Dictionary<string, int>
+        {
+            ["StealthGameMonster_Boss_JieChuan"] = 2,
+            // ["StealthGameMonster_Boss_HuangShang"] = 3,
+        };
 
         private int _debugTick = 0;
         private float _lastStateTime = 0f;              // 上次送 state 的真實時間（穩定頻率用）
@@ -354,7 +412,9 @@ namespace NineSolsRL
                 // ---- boss 偵測 ----
                 float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0, bhpMax = 0;
                 int bossFsm = 0;
-                bool bossPresent = false, bWindup = false, bAttacking = false, bossDead = false;
+                int attackCategory = 0;   // v2.0.0：通用攻擊類別（0-7），未知 boss/FSM 預設 idle
+                int totalPhases = 1;      // v2.0.0：boss 總階段數，未知 boss 預設 1
+                bool bossPresent = false, bossDead = false;
 
                 // 主要：遊戲權威的「當前 boss 血條」→ PostureSystem → MonsterBase
                 MonsterBase boss = null;
@@ -406,14 +466,30 @@ namespace NineSolsRL
                         bhpPct = cap > 0f ? Mathf.Clamp01(remain / cap) : 0f;
                     }
                     catch { }
-                    // 粗粒度 FSM 狀態：AttackPrepose* = 攻擊前置(預警)、Attack* = 攻擊中
+                    // v2.0.0 通用攻擊類別查表：取代舊的 bWindup/bAttacking substring 啟發式。
+                    // 未登錄 boss → fallback idle (0)、totalPhases=1
+                    // 未登錄 FSM → fallback idle (0)
                     try
                     {
                         var cs = boss.CurrentState;
                         bossFsm = (int)cs;
                         string csName = cs.ToString();
-                        bWindup = csName.Contains("Prepose") || csName == "PreAttack";
-                        bAttacking = csName.StartsWith("Attack") && !bWindup && !csName.Contains("Parrying");
+                        string bossName = boss.name;
+
+                        if (_bossFsmCategories.TryGetValue(bossName, out var fsmMap)
+                            && fsmMap.TryGetValue(csName, out int cat))
+                        {
+                            attackCategory = cat;
+                        }
+                        _bossTotalPhases.TryGetValue(bossName, out totalPhases);
+                        if (totalPhases <= 0) totalPhases = 1;
+
+                        // dev：FSM 字串變動時印一行，邊訓邊收集新字串（未在 _bossFsmCategories 內 → 補表）
+                        if (LOG_BOSS_FSM && csName != _lastLoggedBossFsm)
+                        {
+                            Logger.LogInfo($"[boss-fsm] name={bossName} fsm={csName} (int={bossFsm}) cat={attackCategory}");
+                            _lastLoggedBossFsm = csName;
+                        }
                     }
                     catch { }
                     // 真死才 true；換階段 (BossPhaseChangeState) 時 IsDead() 為 false
@@ -445,8 +521,8 @@ namespace NineSolsRL
                     $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
                     $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct},\"bhp_max\":{bhpMax}," +
                     $"\"boss_fsm\":{bossFsm}," +
-                    $"\"boss_windup\":{(bWindup ? "true" : "false")}," +
-                    $"\"boss_attacking\":{(bAttacking ? "true" : "false")}," +
+                    $"\"attack_category\":{attackCategory}," +
+                    $"\"total_phases\":{totalPhases}," +
                     $"\"controllable\":{(controllable ? "true" : "false")}," +
                     $"\"knocked_down\":{(knockedDown ? "true" : "false")}," +
                     $"\"dt\":{dt}," +

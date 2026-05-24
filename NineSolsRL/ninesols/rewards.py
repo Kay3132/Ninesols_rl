@@ -92,10 +92,13 @@ def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) 
             elif pr == 1:
                 r += W_PARRY_IMPRECISE                    # 不精確格檔
 
-        # v1.18.0 防禦引導
-        # 「躲過 boss 攻擊」：boss 構成威脅（windup 或攻擊中）、玩家在接戰範圍內、這幀沒挨打 → +分
-        # 用 prev 的 threat 訊號（避免本幀 transition 邊界誤判）；用 boolean 條件，不開新差分項
-        boss_threat = prev.get("boss_attacking") or prev.get("boss_windup")
+        # v1.18.0 防禦引導(v2.0.0:遷移到 attack_category)
+        # category:0 idle / 1-4 windup(parryable/unparryable/grab/ranged) / 5 attacking
+        #          6 phase_change / 7 stunned
+        # 「躲過 boss 攻擊」:boss 構成威脅(任一 windup 或攻擊中,category 1-5)、玩家在
+        # 接戰範圍內、這幀沒挨打 → +分。用 prev 的 threat 訊號(避免本幀 transition 邊界誤判)。
+        prev_cat = int(prev.get("attack_category", 0))
+        boss_threat = 1 <= prev_cat <= 5
         in_range    = abs(prev.get("bdx", 1e9)) < ENGAGE_RANGE
         got_hit     = dphp < 0
         if boss_threat and in_range and not got_hit:
@@ -103,8 +106,9 @@ def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) 
             dt = min(max(dt, 0.0), 0.2)
             r += W_EVADE_PS * dt
 
-        # 「被預警攻擊命中」：boss 有 windup 預警你還挨打 → 額外扣分（獨立 stream，不進 hurt-cap）
-        if prev.get("boss_windup") and got_hit:
+        # 「被預警攻擊命中」:boss 有任一 windup 預警(category 1-4)你還挨打 → 額外扣分
+        # (獨立 stream,不進 hurt-cap)。attacking (5) 沒 windup 預警階段,不算「被預警還挨打」。
+        if 1 <= prev_cat <= 4 and got_hit:
             r -= W_PUNISH_HIT_DURING_WINDUP
 
     # ---- instrumental：時間懲罰 + 引導接戰（per-step 項乘 dt）----
