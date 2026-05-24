@@ -12,7 +12,9 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from .bridge import GameBridge
-from .rewards import compute_reward, W_BOSS_ENGAGED, W_TRUNCATION, BURST_WINDOW_STEPS, W_BURST_PENALTY
+from .rewards import (compute_reward, W_BOSS_ENGAGED, W_TRUNCATION,
+                      BURST_WINDOW_STEPS, W_BURST_PENALTY,
+                      W_HP_PRESERVED, W_PHASE_NO_HIT, W_SPEED_BONUS)
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -81,6 +83,8 @@ class NineSolsEnv(gym.Env):
         # SIL NEAR 判定用 phase_count >= total_phases 決定是否在最終階段。
         self._phase_count = 1
         self._episode_return = 0.0   # 累計 raw reward,ep-end log 用
+        # v2.0.0 reward v1 B2: 本階段累積玩家 dphp(只記負值,phase change 時若 >= 0 → no-hit bonus)
+        self._phase_dphp_total = 0.0
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -167,6 +171,7 @@ class NineSolsEnv(gym.Env):
         self._last_hit_step = -999  # v1.20.1: burst penalty 狀態歸零
         self._phase_count = 1  # v2.0.0: 新 episode 從 phase 1 起算
         self._episode_return = 0.0  # 累計 raw reward 歸零
+        self._phase_dphp_total = 0.0  # v2.0.0 reward v1 B2: 本階段累積玩家 dphp 歸零
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
         self._boss_engaged = bool(s.get("boss_present"))
         self._prev_raw = s
@@ -202,6 +207,8 @@ class NineSolsEnv(gym.Env):
                 if self._steps - self._last_hit_step < BURST_WINDOW_STEPS:
                     reward -= W_BURST_PENALTY
                 self._last_hit_step = self._steps
+                # v2.0.0 reward v1 B2: 累積本階段挨打 dphp(<0),phase change 時若仍 ==0 給 no-hit bonus
+                self._phase_dphp_total += dphp
 
         # 一次性：本局首次讓 boss 出現/接戰 → 給接戰 bonus
         if s.get("boss_present") and not self._boss_engaged:
@@ -221,7 +228,15 @@ class NineSolsEnv(gym.Env):
                 #print(f"[milestone] step={self._steps} phase change "
                 #      f"(bhp_pct {prev_bhp:.2f}→{cur_bhp:.2f}) 里程碑重設")
                 self._phase_count += 1  # v2.0.0: SIL NEAR 判定要知道目前在第幾階段
-                print(f"[milestone] step={self._steps} Phase change → phase {self._phase_count}")
+                # v2.0.0 reward v1 B2: 上一階段全程無傷(dphp 累積 0)→ bonus
+                if self._phase_dphp_total >= 0:
+                    reward += W_PHASE_NO_HIT
+                    print(f"[milestone] step={self._steps} Phase change → phase {self._phase_count} "
+                          f"[NO-HIT bonus +{W_PHASE_NO_HIT:.0f}]")
+                else:
+                    print(f"[milestone] step={self._steps} Phase change → phase {self._phase_count} "
+                          f"(本階段挨打 dphp={self._phase_dphp_total:.2f})")
+                self._phase_dphp_total = 0.0  # 重設給下一階段
                 self._milestones_hit.clear()
             # 觸發跨越本階段門檻的里程碑（一步可能跨多個）
             for threshold, bonus in MILESTONES:
@@ -236,12 +251,25 @@ class NineSolsEnv(gym.Env):
         # v1.20: 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間到 truncation 免死亡懲罰」exploit
         if truncated and not terminated:
             reward -= W_TRUNCATION
+
+        # v2.0.0 reward v1 B1+B3: WIN 才觸發 HP 保留 bonus + 速通 bonus
+        # 限定 won = terminated + boss_dead(排除 truncation 或玩家死亡)
+        won = bool(terminated and s.get("boss_dead"))
+        if won:
+            php_pct_end = float(s.get("php_pct", 0.0))
+            hp_bonus = W_HP_PRESERVED * (php_pct_end ** 2)
+            time_fraction = self._steps / max(1, self._effective_max_steps)
+            speed_bonus = W_SPEED_BONUS * ((1.0 - time_fraction) ** 2)
+            reward += hp_bonus + speed_bonus
+            print(f"[win-bonus] HP {php_pct_end:.2f} → +{hp_bonus:.1f}, "
+                  f"time {time_fraction:.2f} → +{speed_bonus:.1f}")
+
         self._prev_raw = s
         self._episode_return += float(reward)  # 累計 raw reward,ep-end log 用
 
         # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）
+        # 注:won 在上方 B1/B3 區已算過,這裡直接用
         if terminated or truncated:
-            won = bool(terminated and s.get("boss_dead"))
             if not self._first_episode_done:
                 # v1.20.1: 首次 episode 是 train.py 啟動 Suicide 後的「測試 episode」，
                 # 不計入 curriculum stats 避免初始狀態污染學習

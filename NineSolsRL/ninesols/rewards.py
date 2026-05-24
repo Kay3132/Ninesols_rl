@@ -11,24 +11,22 @@ rewards.py —— 三層 reward（參考 Hollow Knight RL 論文）
 # ---- 權重----
 # 壓縮極端值，將 Base/Sub 與 Instrumental 的落差控制在 100 倍以內。
 W_WIN          = 50.0     # 擊敗 boss (clip_reward=10 已是上限，加大無效)
-W_DEATH        = 20.0     # 玩家死亡 (降維)
+W_DEATH        = 50.0     # v2.0.0 reward v1: 20 → 50,配合 quadratic hurt 倍增
 W_BOSS_HURT    = 100.0    # boss 每損失 1.0 血量比例（v1.19.0: 50→100，加重 damage 訊號）
 W_TRUNCATION   = 150.0    # v1.20.0: episode 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間 exploit」
 
-# v1.20.2: hurt penalty 改 quadratic（取代原 linear + W_MAX_HURT_PENALTY cap）
-# 動機：原 linear+cap 在「滿 cap 後被打死」情境下 reward = 0（phase 2 close-out 殞落）。
-# 改 quadratic 之後:
-#   - 小擊 (5%) = 0.4 點 (比舊 1.0 還輕 → 接戰退縮風險更低)
-#   - 中擊 (25%) = 9.4 點
-#   - 重擊 (50%) = 37.5 點（舊 cap=10）
-#   - 致命 (100%) = 150 點
-# 訊號連續、不需 cap、不需 cumulative_hurt 追蹤。burst penalty 仍保留抓 combo。
-W_PLAYER_HURT_Q = 150.0   # quadratic 係數,r -= W_PLAYER_HURT_Q * dphp^2
+# v2.0.0 reward v1: quadratic 係數 150 → 300(強化「不硬扛傷害」)
+#   - 5% 擊 = 0.75
+#   - 10% 擊 = 3.0
+#   - 25% 擊 = 18.75
+#   - 50% 擊 = 75
+#   - 100% 致命 = 300
+# 新交易表:30% HP for 50% boss HP = 300×0.09=27 vs +50 boss = +23(仍正但減半)
+W_PLAYER_HURT_Q = 300.0   # quadratic 係數,r -= W_PLAYER_HURT_Q * dphp^2
 
-# v1.20.1: burst damage penalty —— 短時間連續挨打(連段)額外懲罰，獨立 stream
-# quadratic 對「連 5 擊」跟「散 5 擊」給同樣分,burst 仍負責抓 combo 訊號
+# v1.20.1 burst penalty + v2.0.0 reward v1: 10 → 25(連擊更不可接受;連 4 擊 -100)
 BURST_WINDOW_STEPS = 30   # ~1s @30Hz
-W_BURST_PENALTY    = 10.0
+W_BURST_PENALTY    = 25.0
 
 W_PARRY_PRECISE   = 20.0  # 精確格檔（v1.18.0: 5→20，格檔是稀有事件，單次給足夠分量）
 W_PARRY_IMPRECISE = 5.0   # 不精確格檔（v1.18.0: 1→5）
@@ -37,11 +35,21 @@ W_PARRY_IMPRECISE = 5.0   # 不精確格檔（v1.18.0: 1→5）
 W_EVADE_PS               = 2.0   # 每秒：boss 在 windup/attacking 且玩家在 range 內、這幀沒挨打 → 加分
 W_PUNISH_HIT_DURING_WINDUP = 5.0  # 一次性：boss 有 windup 預警你還挨打 → 額外扣分（獨立於 hurt-cap）
 
+# v2.0.0 reward v1: no-hit / 速通激勵(env.py 套用,需要 per-episode 狀態)
+# B1: WIN 時依玩家剩 HP 給 bonus(quadratic 偏好滿血)
+#   php_pct=1.0 → +150;0.5 → +37.5;0.1 → +1.5
+W_HP_PRESERVED = 150.0
+# B2: 每階段清完若 _phase_dphp_total >= 0(本階段沒挨打)→ bonus
+W_PHASE_NO_HIT = 30.0
+# B3: WIN 時依「用了 max_steps 多少比例」給速通 bonus(quadratic 強烈偏好極速)
+#   10% 時間 → +162;30% → +98;50% → +50;90% → +8
+W_SPEED_BONUS  = 200.0
+
 # --- instrumental：per-step 項一律改「每秒速率」，compute_reward 內乘 dt ---
 # 為什麼改 dt-based：原本「每步固定值」在遊戲加速 / fps 抖動時，「每秒幾步」
 # 會變 → 每秒拿到的 reward 跟著漂。改成「每秒速率 × dt」後不管 1×/2× 加速、
 # fps 怎麼抖，每「遊戲秒」拿到的 reward 都一樣 → 加速訓練→1× 跑可完美銜接。
-W_TIME_PENALTY_PS = -0.3  # 每秒：時間懲罰（原 -0.01/步 @30Hz）
+W_TIME_PENALTY_PS = -1.0  # v2.0.0 reward v1: -0.3 → -1.0,連續時間壓力配合 B3 速通 bonus
 W_IN_RANGE_PS     = 1.0   # 每秒：處於接戰距離內（v1.19.0: 3→1，降 per-second 主導性）
 W_FACE_BOSS_PS    = 0.5   # 每秒：面向 boss（v1.19.0: 1.5→0.5）
 # W_COWARD 從原 -0.2/步(=-6/秒) 大幅調小：原值太大時，「衝過去送死」會比
