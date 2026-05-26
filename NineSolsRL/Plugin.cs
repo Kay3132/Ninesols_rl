@@ -99,6 +99,34 @@ namespace NineSolsRL
             // ["StealthGameMonster_Boss_HuangShang"] = 3,
         };
 
+        // v2.0.0 per-boss attack ID 表(平行 _bossFsmCategories,給 policy 細粒度區分同 boss 內
+        // 不同 attack# 的能力)。slot 0~MAX_ATTACK_IDS-1,語意 per-boss 各自定義。
+        // 未登錄 boss / 未登錄 FSM → attack_id = -1 (env.py one-hot 全 0,表示「非特定 attack」)。
+        public const int MAX_ATTACK_IDS = 20;
+        private static readonly Dictionary<string, Dictionary<string, int>> _bossAttackIds
+            = new Dictionary<string, Dictionary<string, int>>
+        {
+            ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
+            {
+                ["PreAttack"]     = 0,
+                ["Attack1"]       = 1,
+                ["Attack2"]       = 2,
+                ["Attack3"]       = 3,
+                ["Attack4"]       = 4,
+                ["Attack5"]       = 5,
+                ["Attack6"]       = 6,
+                ["Attack7"]       = 7,
+                ["Attack8"]       = 8,
+                ["Attack9"]       = 9,
+                ["Attack11"]      = 10,
+                ["Attack12"]      = 11,
+                ["Attack14"]      = 12,
+                ["Hurt_Big"]      = 13,
+                ["PostureBreak"]  = 14,
+                // slot 15-19 留白給 phase 2 新 FSM
+            },
+        };
+
         private int _debugTick = 0;
         private float _lastStateTime = 0f;              // 上次送 state 的真實時間（穩定頻率用）
         private float _lastGameTime  = 0f;              // 上次送 state 的遊戲時間（算 dt 用）
@@ -414,6 +442,7 @@ namespace NineSolsRL
                 int bossFsm = 0;
                 int attackCategory = 0;   // v2.0.0：通用攻擊類別（0-7），未知 boss/FSM 預設 idle
                 int totalPhases = 1;      // v2.0.0：boss 總階段數，未知 boss 預設 1
+                int attackId = -1;        // v2.0.0：per-boss attack ID（0~MAX_ATTACK_IDS-1），未登錄 = -1
                 bool bossPresent = false, bossDead = false;
 
                 // 主要：遊戲權威的「當前 boss 血條」→ PostureSystem → MonsterBase
@@ -484,6 +513,13 @@ namespace NineSolsRL
                         _bossTotalPhases.TryGetValue(bossName, out totalPhases);
                         if (totalPhases <= 0) totalPhases = 1;
 
+                        // v2.0.0 per-boss attack ID 查表(細粒度,跟 attack_category 並存)
+                        if (_bossAttackIds.TryGetValue(bossName, out var atkMap)
+                            && atkMap.TryGetValue(csName, out int aid))
+                        {
+                            attackId = aid;
+                        }
+
                         // dev：FSM 字串變動時印一行，邊訓邊收集新字串（未在 _bossFsmCategories 內 → 補表）
                         if (LOG_BOSS_FSM && csName != _lastLoggedBossFsm)
                         {
@@ -522,6 +558,7 @@ namespace NineSolsRL
                     $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct},\"bhp_max\":{bhpMax}," +
                     $"\"boss_fsm\":{bossFsm}," +
                     $"\"attack_category\":{attackCategory}," +
+                    $"\"attack_id\":{attackId}," +
                     $"\"total_phases\":{totalPhases}," +
                     $"\"controllable\":{(controllable ? "true" : "false")}," +
                     $"\"knocked_down\":{(knockedDown ? "true" : "false")}," +

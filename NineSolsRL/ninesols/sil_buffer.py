@@ -30,8 +30,8 @@ import numpy as np
 
 
 class SILBuffer:
-    # v2.0.0: 跟 env.NineSolsEnv.OBS_DIM 同步(17 base + 8 attack_category one-hot)
-    OBS_DIM = 25
+    # v2.0.0: 跟 env.NineSolsEnv.OBS_DIM 同步(17 base + 8 attack_category + 20 attack_id one-hot)
+    OBS_DIM = 45
     ACT_DIM = 3   # MultiDiscrete([3, 3, 6])
 
     def __init__(self, max_transitions: int = 100_000,

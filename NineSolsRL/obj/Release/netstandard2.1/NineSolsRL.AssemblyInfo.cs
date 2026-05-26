@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("NineSolsRL")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fe18b9c4d858f1efa3e2d4bb1a9cd11b431c0cb7")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+dec1ede12270e4dfed602d3eaceac8ead3cc1d6a")]
 [assembly: System.Reflection.AssemblyProductAttribute("NineSolsRL")]
 [assembly: System.Reflection.AssemblyTitleAttribute("NineSolsRL")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

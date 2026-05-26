@@ -25,6 +25,11 @@ INJ_SCALE = 100.0    # 內傷
 # 4 ranged_windup / 5 attacking / 6 phase_change / 7 stunned
 N_ATTACK_CATEGORIES = 8
 
+# v2.0.0: per-boss attack ID one-hot 容量(跟 Plugin.cs MAX_ATTACK_IDS 同步)。
+# 給 policy 細粒度區分同 boss 內不同 attack# 的能力。slot 語意 per-boss 各自定義,
+# 未登錄 FSM → mod 端送 -1 → 這裡 one-hot 全 0。
+N_ATTACK_IDS = 20
+
 # ---- curriculum：弱化 boss，讓「贏」變得可達 ----
 # boss 有效 HP = boss_hp_scale × maxHP。從 START 開始，最近 WINDOW 場勝率
 # ≥ WIN_RATE 就 +STEP，直到 MAX(1.0)。勝率不到就停在原難度（自我修正）。
@@ -52,8 +57,8 @@ PHASE_CHANGE_DELTA = 0.5  # bhp_pct 一步上升 > 此值 → 視為 phase chang
 class NineSolsEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    # v2.0.0: 19 → 25(-2 boolean +8 one-hot)
-    OBS_DIM = 17 + N_ATTACK_CATEGORIES   # = 25
+    # v2.0.0: 25 → 45 (+20 per-boss attack ID one-hot)
+    OBS_DIM = 17 + N_ATTACK_CATEGORIES + N_ATTACK_IDS   # = 17 + 8 + 20 = 45
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
                  max_steps: int = 1500):
@@ -93,6 +98,12 @@ class NineSolsEnv(gym.Env):
         cat = int(s.get("attack_category", 0))
         cat = max(0, min(N_ATTACK_CATEGORIES - 1, cat))
         cat_onehot = [1.0 if i == cat else 0.0 for i in range(N_ATTACK_CATEGORIES)]
+        # v2.0.0: per-boss attack ID one-hot。mod 端送 -1 = 不在 attack ID 表內 → 全 0。
+        # 0 ~ N_ATTACK_IDS-1 才會點亮對應 slot。語意 per-boss(見 Plugin.cs _bossAttackIds)。
+        aid = int(s.get("attack_id", -1))
+        id_onehot = [0.0] * N_ATTACK_IDS
+        if 0 <= aid < N_ATTACK_IDS:
+            id_onehot[aid] = 1.0
         return np.array([
             s.get("vx", 0.0) / VEL_SCALE,
             s.get("vy", 0.0) / VEL_SCALE,
@@ -112,6 +123,7 @@ class NineSolsEnv(gym.Env):
             s.get("last_parry_result", 0) / 2.0,    # 0 無 / 0.5 不精確 / 1 精確
             1.0 if s.get("knocked_down") else 0.0,   # 玩家受傷/倒地（可用閃避起身）
             *cat_onehot,                             # v2.0.0: 8 個通用 attack category one-hot
+            *id_onehot,                              # v2.0.0: 20 個 per-boss attack ID one-hot
         ], dtype=np.float32)
 
     @staticmethod
