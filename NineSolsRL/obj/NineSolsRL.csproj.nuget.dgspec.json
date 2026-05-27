@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "e:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj": {}
+    "E:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj": {}
   },
   "projects": {
-    "e:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj": {
+    "E:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "e:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj",
+        "projectUniqueName": "E:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj",
         "projectName": "NineSolsRL",
-        "projectPath": "e:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj",
+        "projectPath": "E:\\Ninesols_rl\\NineSolsRL\\NineSolsRL.csproj",
         "packagesPath": "C:\\Users\\kay31\\.nuget\\packages\\",
-        "outputPath": "e:\\Ninesols_rl\\NineSolsRL\\obj\\",
+        "outputPath": "E:\\Ninesols_rl\\NineSolsRL\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\kay31\\AppData\\Roaming\\NuGet\\NuGet.Config",

@@ -82,9 +82,11 @@ namespace NineSolsRL
                 ["TurnAround"]    = 0,  // idle:轉身
                 ["Undefined"]     = 0,  // idle:FSM 過渡(顯式登錄)
                 ["WanderingIdle"] = 0,  // idle:閒晃(顯式登錄)
+                ["LastHit"]       = 5,  // 2026-05-27: 觀察大量 Explosion unparriable hitbox → 攻擊類
+                                        //              動態 isUnparriable 偵測會把 cat=5 override 成 cat=2
                 // ---- TBD----
                 // ["BossAngry"] // 是否有無敵幀/紅光?選 0/1/6
-                // ["LastHit"]   // 中場狀態,語意未明
+                //                  觀察:偶見 boss children active=1(boss 自傷反應),不是紅光 → 維持 0
             },
             // 未來新 boss：加 entry。例：
             // ["StealthGameMonster_Boss_HuangShang"] = new Dictionary<string, int> { ... },
@@ -123,7 +125,8 @@ namespace NineSolsRL
                 ["Attack14"]      = 12,
                 ["Hurt_Big"]      = 13,
                 ["PostureBreak"]  = 14,
-                // slot 15-19 留白給 phase 2 新 FSM
+                ["LastHit"]       = 15,
+                // slot 16-19 留白給 phase 2 新 FSM
             },
         };
 
@@ -345,17 +348,18 @@ namespace NineSolsRL
                 if (state != null) SendState(state);
             }
 
-            if (_debugTick % 120 == 0)
-            {
-                var p = Player.i;
-                string st = "null";
-                try { if (p != null) st = p.CurrentStateType.ToString(); } catch { }
-                Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
-                               $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
-                               $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
-                               $"heal={_healPulse} bossHpScale={_bossHpScale:F2} " +
-                               $"boss={_lastBossInfo} state={st}");
-            }
+            // [RL] periodic tick log 註解掉(訓練期不需,log 太雜)
+            //if (_debugTick % 120 == 0)
+            //{
+            //    var p = Player.i;
+            //    string st = "null";
+            //    try { if (p != null) st = p.CurrentStateType.ToString(); } catch { }
+            //    Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
+            //                   $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
+            //                   $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
+            //                   $"heal={_healPulse} bossHpScale={_bossHpScale:F2} " +
+            //                   $"boss={_lastBossInfo} state={st}");
+            //}
         }
 
         private void TryConnect()
@@ -520,10 +524,62 @@ namespace NineSolsRL
                             attackId = aid;
                         }
 
+                        // v2.0.0 unparryable 偵測(scene-wide):掃整個 scene 的 DamageDealer。
+                        // 為什麼不用 boss.GetComponentsInChildren:介川的真正 hitbox 在 scene root
+                        // 動態 spawn,不在 boss 子物件樹下。boss children 永遠 act=0。
+                        // 改用 FindObjectsOfType 搜 scene 中所有 active+!parriable+MonsterAttack 的 DD。
+                        // flag 位置驗證:DamageDealer.cs:446 `public bool parriable = true`
+                        // 使用點:ParriableAttackEffect.cs:157 `if (!component.parriable) return false`
+                        bool isUnparriable = false;
+                        int sceneMonAct = 0, sceneMonUnp = 0;
+                        var sceneUnpNames = new System.Collections.Generic.List<string>();
+                        try
+                        {
+                            var allDD = UnityEngine.Object.FindObjectsOfType<DamageDealer>();
+                            foreach (var dd in allDD)
+                            {
+                                if (dd == null || !dd.isActiveAndEnabled) continue;
+                                if (dd.type != DamageType.MonsterAttack) continue;
+                                sceneMonAct++;
+                                if (!dd.parriable)
+                                {
+                                    sceneMonUnp++;
+                                    sceneUnpNames.Add(dd.gameObject.name);
+                                    isUnparriable = true;
+                                }
+                            }
+                        }
+                        catch { }
+                        // 2026-05-27: 殘留紅光 hitbox 修法 —— 放寬 override 條件
+                        // 觀察到 attack 結束後 FSM 已切到 idle/turn/preattack（WanderingIdle 79 次、
+                        // TurnAround 38 次、PreAttack 22 次 in 1 session），但 explosion DamageDealer
+                        // 還沒清掉 → policy 看到 cat=0/1 沒警告 → 被殘留紅光炸。
+                        // 放寬：任何 FSM 配 scene 紅光都 override 成 cat=2，
+                        // 讓「場上有紅光」這個 universal 警告訊號優先於 FSM 語義。
+                        if (isUnparriable)
+                        {
+                            attackCategory = 2;   // unparryable_windup slot 重用為 "unparryable attack"
+                        }
+
                         // dev：FSM 字串變動時印一行，邊訓邊收集新字串（未在 _bossFsmCategories 內 → 補表）
                         if (LOG_BOSS_FSM && csName != _lastLoggedBossFsm)
                         {
-                            Logger.LogInfo($"[boss-fsm] name={bossName} fsm={csName} (int={bossFsm}) cat={attackCategory}");
+                            // diagnostic:同時印 boss-children + scene-wide 兩種統計
+                            int ddAll = 0, ddActive = 0;
+                            try
+                            {
+                                var all = boss.GetComponentsInChildren<DamageDealer>(true);
+                                ddAll = all.Length;
+                                foreach (var dd in all)
+                                {
+                                    if (dd != null && dd.isActiveAndEnabled) ddActive++;
+                                }
+                            }
+                            catch { }
+                            Logger.LogInfo($"[boss-fsm] name={bossName} fsm={csName} (int={bossFsm}) cat={attackCategory} " +
+                                           $"DD bossAll={ddAll} bossAct={ddActive} | " +
+                                           $"scene MonAct={sceneMonAct} MonUnp={sceneMonUnp} " +
+                                           $"unp=[{string.Join(",", sceneUnpNames)}]");
                             _lastLoggedBossFsm = csName;
                         }
                     }
