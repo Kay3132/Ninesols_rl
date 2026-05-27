@@ -10,8 +10,8 @@ rewards.py —— 三層 reward（參考 Hollow Knight RL 論文）
 
 # ---- 權重----
 # 壓縮極端值，將 Base/Sub 與 Instrumental 的落差控制在 100 倍以內。
-W_WIN          = 50.0     # 擊敗 boss (clip_reward=10 已是上限，加大無效)
-W_DEATH        = 20.0     # 玩家死亡 (降維)
+W_WIN          = 150.0    # 50 → 150 (2026-05-27): plateau 5-15% 勝率，拉開 WIN/LOSE gradient
+W_DEATH        = 50.0     # 20 → 50  (2026-05-27): 對稱配對 W_WIN，加重死亡懲罰
 W_BOSS_HURT    = 100.0    # boss 每損失 1.0 血量比例（v1.19.0: 50→100，加重 damage 訊號）
 W_TRUNCATION   = 150.0    # v1.20.0: episode 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間 exploit」
 
