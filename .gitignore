@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# RL training artifacts (large files — must NOT go into git)
+*.zip
+*.pkl
+checkpoints/
+checkpoints*/
+**/checkpoints/
+**/checkpoints*/
+
+# Logs / runs
+*.log
+runs/
+tensorboard/
+*.tensorflow
+
+# Build
+obj/
+bin/
