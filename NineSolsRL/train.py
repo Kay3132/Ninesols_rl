@@ -16,20 +16,23 @@ v1.21.0:加掛 SIL —— 在不丟現有 PPO checkpoint 的前提下,讓 agent 
 import os
 import re
 import glob
+from datetime import datetime
 
 import torch
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CallbackList
+from stable_baselines3.common.logger import configure  # rebuilt 9046049: per-iteration CSV
 
 from ninesols import NineSolsEnv
 from ninesols.ppo_sil import PPOSIL, DEFAULT_SIL_CFG
 from ninesols.sil_buffer import SILBuffer
 from ninesols.sil_callbacks import (SILEpisodeRecorderCallback,
                                     SILBufferCheckpointCallback,
+                                    EpisodeCSVCallback,
                                     find_latest_sil_buffer)
 
-TOTAL_TIMESTEPS = 1_000_000        # 絕對目標步數
+TOTAL_TIMESTEPS = 5_000_000        # 絕對目標步數  # rebuilt f3502a7 2026-06-13: 1M → 3M
 GAMMA           = 0.98
 NAME_PREFIX     = "ppo_ninesols"
 SAVE_PATH       = "ppo_ninesols"
@@ -94,7 +97,8 @@ def main():
         # 用 PPOSIL.load 載入:SB3 honors caller class → instance 會是 PPOSIL,
         # weights 從 vanilla PPO zip 對得回來(class 名沒被存在 zip 內)。
         model = PPOSIL.load(latest_zip, env=env, device=device)
-        print(f"[train] 已載入,目前步數 = {model.num_timesteps}")
+        model.ent_coef = 0.005
+        print(f"[train] 已載入,目前步數 = {model.num_timesteps}, ent_coef={model.ent_coef}")
     else:
         print("[train] 沒有 checkpoint,從零開始訓練")
         env = make_vecnormalize(venv)
@@ -106,6 +110,7 @@ def main():
             batch_size=256,
             gamma=GAMMA,
             learning_rate=3e-4,
+            ent_coef=0.005,
         )
 
     # SIL buffer:對應 ckpt 步數的 pkl,沒有就空起跑
@@ -121,17 +126,29 @@ def main():
     model.attach_sil(sil_buffer, env, SIL_CFG)
     print(f"[train] SIL config: {SIL_CFG}")
 
+    # rebuilt 9046049 2026-06-14: PPO per-iteration CSV logging。
+    # SB3 內建 logger：每個 PPO iteration dump 一列(ep_rew_mean/ep_len_mean/loss/
+    # entropy/sil_* 等全部 metrics)→ logs/run_<時間>/progress.csv。
+    # 每次啟動開新 run 資料夾，避免續訓覆蓋掉前一輪的 csv。
+    log_dir = os.path.join("logs", datetime.now().strftime("run_%Y%m%d_%H%M%S"))
+    os.makedirs(log_dir, exist_ok=True)
+    model.set_logger(configure(log_dir, ["stdout", "csv"]))
+    print(f"[train] PPO/SIL metrics → {os.path.join(log_dir, 'progress.csv')}")
+
     # callback:ckpt(含 vecnormalize + sil buffer)+ recorder
     ckpt_cb = SILBufferCheckpointCallback(
         sil_buffer=sil_buffer,
-        save_freq=20480,
+        save_freq=102400,
         save_path=CKPT_DIR,
         name_prefix=NAME_PREFIX,
         save_vecnormalize=True,
         verbose=1,
     )
     recorder_cb = SILEpisodeRecorderCallback(sil_buffer, verbose=1)
-    callbacks = CallbackList([ckpt_cb, recorder_cb])
+    # rebuilt 9046049 2026-06-14: per-episode CSV(logs/run_*/episodes.csv)，
+    # 用 total_timesteps 與 PPO progress.csv 對齊
+    episode_csv_cb = EpisodeCSVCallback(verbose=1)
+    callbacks = CallbackList([ckpt_cb, recorder_cb, episode_csv_cb])
 
     try:
         if resumed:

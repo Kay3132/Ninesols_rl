@@ -1,4 +1,4 @@
-"""
+﻿"""
 env.py —— NineSolsEnv：標準 Gymnasium 環境
 
 時序模型：free-running 30Hz。遊戲不暫停，每個 step 約 33ms 遊戲時間。
@@ -12,7 +12,8 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from .bridge import GameBridge
-from .rewards import compute_reward, W_BOSS_ENGAGED, W_TRUNCATION, BURST_WINDOW_STEPS, W_BURST_PENALTY
+from .rewards import (compute_reward, W_BOSS_ENGAGED, W_TRUNCATION,
+                      BURST_WINDOW_STEPS, W_BURST_PENALTY, W_SPEED_BONUS)
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -33,7 +34,7 @@ N_ATTACK_IDS = 20
 # ---- curriculum：弱化 boss，讓「贏」變得可達 ----
 # boss 有效 HP = boss_hp_scale × maxHP。從 START 開始，最近 WINDOW 場勝率
 # ≥ WIN_RATE 就 +STEP，直到 MAX(1.0)。勝率不到就停在原難度（自我修正）。
-CURRICULUM_START    = 0.10
+CURRICULUM_START    = 0.15
 CURRICULUM_MAX      = 1.00
 CURRICULUM_STEP     = 0.15
 CURRICULUM_WINDOW   = 20
@@ -58,7 +59,10 @@ class NineSolsEnv(gym.Env):
     metadata = {"render_modes": []}
 
     # v2.0.0: 25 → 45 (+20 per-boss attack ID one-hot)
-    OBS_DIM = 17 + N_ATTACK_CATEGORIES + N_ATTACK_IDS   # = 17 + 8 + 20 = 45
+    # rebuilt 1a41c9a/04fa407 2026-06-13: 45 → 56。+11 新 obs(由部署 dll 還原確認:
+    # shield ×2 + hazard ×7 + attack_nearest ×2)。順序為災後 best-effort 重建,
+    # 對齊 3.8M 步 checkpoint(policy 第一層 = 64×56)。
+    OBS_DIM = 17 + N_ATTACK_CATEGORIES + N_ATTACK_IDS + 11   # = 17 + 8 + 20 + 11 = 56
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
                  max_steps: int = 1500):
@@ -86,6 +90,9 @@ class NineSolsEnv(gym.Env):
         # SIL NEAR 判定用 phase_count >= total_phases 決定是否在最終階段。
         self._phase_count = 1
         self._episode_return = 0.0   # 累計 raw reward,ep-end log 用
+        # rebuilt 2026-06-14: 本回合開場的累積 parry 計數（ep-end 取 delta = 本場次數）
+        self._ep_start_parry_atm = 0   # parry_enter_count（嘗試）
+        self._ep_start_parry_ok = 0    # parry_count（成功）
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -124,6 +131,19 @@ class NineSolsEnv(gym.Env):
             1.0 if s.get("knocked_down") else 0.0,   # 玩家受傷/倒地（可用閃避起身）
             *cat_onehot,                             # v2.0.0: 8 個通用 attack category one-hot
             *id_onehot,                              # v2.0.0: 20 個 per-boss attack ID one-hot
+            # rebuilt 2026-06-13: 45→56 的 11 個新維度(欄位由部署 dll 的 Plugin.cs 確認)。
+            # 順序為 best-effort 重建,需用 3.8M checkpoint 實跑驗證(見 plan)。
+            1.0 if s.get("shield_active") else 0.0,             # idx45 1a41c9a shield
+            s.get("shield_hp_pct", 0.0),                        # idx46
+            float(s.get("hazard_unparryable", 0)) / 5.0,        # idx47
+            s.get("hazard_nearest_dx", 0.0) / POS_SCALE,        # idx48
+            s.get("hazard_nearest_dy", 0.0) / POS_SCALE,        # idx49
+            float(s.get("hazard_type_explosion", 0)),           # idx50
+            float(s.get("hazard_type_damagearea", 0)),          # idx51
+            s.get("attack_nearest_dx", 0.0) / POS_SCALE,        # idx52 04fa407 +parrable
+            s.get("attack_nearest_dy", 0.0) / POS_SCALE,        # idx53
+            float(s.get("hazard_count", 0)) / 5.0,              # idx54 rose R9 tail
+            float(s.get("hazard_type_danger", 0)),              # idx55
         ], dtype=np.float32)
 
     @staticmethod
@@ -181,6 +201,9 @@ class NineSolsEnv(gym.Env):
         self._episode_return = 0.0  # 累計 raw reward 歸零
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
         self._boss_engaged = bool(s.get("boss_present"))
+        # rebuilt 2026-06-14: 記下開場的累積 parry 計數（遊戲端累積值，ep-end 取差）
+        self._ep_start_parry_atm = int(s.get("parry_enter_count", 0))
+        self._ep_start_parry_ok = int(s.get("parry_count", 0))
         self._prev_raw = s
         # 診斷：boss 起始 HP vs 未縮放滿血。ratio 應 ≈ scale（若縮放生效）
         _bhp = s.get("bhp", 0.0)
@@ -196,7 +219,14 @@ class NineSolsEnv(gym.Env):
         # 接戰前禁用消耗性資源動作：長程(ammo)/喝藥(potion) 都是有限數量且不在 obs 裡，
         # boss 戰前的長游走會把它們耗光。用 sticky 的 _boss_engaged（非即時 boss_present）
         # → boss 偵測 flicker 免疫，一旦接戰過就永久解除、戰鬥中絕不誤擋。
-        if not self._boss_engaged and act["attack"] in (2, 5):
+        if not self._boss_engaged and act["attack"] in (2, 3, 5):
+            act["attack"] = 0
+
+        # rebuilt 4f38deb 2026-06-13: 滿血(php_pct >= 99%)時禁止喝藥(attack=5)，
+        # 省藥給 phase 2 close-out。獨立 gate，與 _boss_engaged 無關、戰鬥中也生效。
+        # 用 self._prev_raw 的 php_pct（step 開頭尚未收新 state）。
+        if act["attack"] == 5 and self._prev_raw is not None \
+                and self._prev_raw.get("php_pct", 1.0) >= 0.99:
             act["attack"] = 0
 
         self.bridge.send_action(act)
@@ -248,12 +278,37 @@ class NineSolsEnv(gym.Env):
         # v1.20: 撞 max_steps 沒贏沒死 → 額外懲罰，封堵「拖時間到 truncation 免死亡懲罰」exploit
         if truncated and not terminated:
             reward -= W_TRUNCATION
+        # rebuilt 2026-06-14: 快速通關 bonus —— 只在真 WIN(boss 真死)觸發。
+        # time_fraction 用 _effective_max_steps（已隨 curriculum 放大）→ bonus 自動依難度縮放。
+        # linear：越快清越肥（用掉 30% 時間 → 0.7×；80% → 0.2×）。
+        if terminated and s.get("boss_dead"):
+            time_fraction = self._steps / max(1, self._effective_max_steps)
+            reward += W_SPEED_BONUS * (1.0 - time_fraction)
         self._prev_raw = s
         self._episode_return += float(reward)  # 累計 raw reward,ep-end log 用
 
         # episode 結束 → 記錄勝負給 curriculum（勝 = boss 真死，2 階段全清）
+        ep_summary = None
         if terminated or truncated:
             won = bool(terminated and s.get("boss_dead"))
+            # rebuilt 2026-06-14: 本場 parry 次數（遊戲端累積值取 delta）+ chi / phase / bhp。
+            parry_atm = int(s.get("parry_enter_count", 0)) - self._ep_start_parry_atm
+            parry_ok  = int(s.get("parry_count", 0)) - self._ep_start_parry_ok
+            total_phases = int(s.get("total_phases", 1))
+            # ep-end 尾巴：每欄獨立 key=value（CSV 友善，不用斜線）
+            ep_extra = (f"| parry={parry_ok} atm={parry_atm} "
+                        f"chi={s.get('chi', 0):.0f} phase={self._phase_count}/{total_phases} "
+                        f"| bhp={s.get('bhp', 0):.0f} bhp%={s.get('bhp_pct', 0):.0%} ")
+            # per-episode CSV 用（EpisodeCSVCallback 會再補 total_timesteps）
+            ep_summary = {
+                "scale": round(float(self._boss_hp_scale), 4), "won": int(won),
+                "steps": self._steps, "ret": round(float(self._episode_return), 2),
+                "parry_ok": parry_ok, "parry_atm": parry_atm,
+                "chi": int(s.get("chi", 0)), "phase": self._phase_count,
+                "total_phases": total_phases,
+                "bhp": round(float(s.get("bhp", 0)), 1),
+                "bhp_pct": round(float(s.get("bhp_pct", 0)), 4),
+            }
             if not self._first_episode_done:
                 # v1.20.1: 首次 episode 是 train.py 啟動 Suicide 後的「測試 episode」，
                 # 不計入 curriculum stats 避免初始狀態污染學習
@@ -261,8 +316,7 @@ class NineSolsEnv(gym.Env):
                 print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
                       f"{'WIN' if won else 'lose'} steps={self._steps} "
                       f"ret={self._episode_return:.1f} "
-                      f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
-                      f"| [首次 episode, 不計入 curriculum]")
+                      f"{ep_extra}| [首次 episode, 不計入 curriculum]")
             else:
                 self._recent_outcomes.append(won)
                 n = len(self._recent_outcomes)
@@ -270,15 +324,16 @@ class NineSolsEnv(gym.Env):
                 print(f"[ep-end] scale={self._boss_hp_scale:.2f} "
                       f"{'WIN' if won else 'lose'} steps={self._steps} "
                       f"ret={self._episode_return:.1f} "
-                      f"| boss_present={s.get('boss_present')} bhp={s.get('bhp', 0):.0f} "
-                      f"| 近{n}場勝率 {wr:.0%}")
+                      f"{ep_extra}| 近{n}場勝率 {wr:.0%}")
 
         # v2.0.0: phase_count 是 env 端追蹤的,塞進 s 一起給 SIL recorder
         # (total_phases 已由 mod 端 JSON 帶在 s 裡,不用額外注入)
         s["phase_count"] = self._phase_count
-        return (self._encode_obs(s), reward, terminated, truncated,
-                {"raw": s, "boss_hp_scale": self._boss_hp_scale,
-                 "raw_reward": float(reward)})  # SIL recorder 抓未 normalize 的 reward
+        info = {"raw": s, "boss_hp_scale": self._boss_hp_scale,
+                "raw_reward": float(reward)}  # SIL recorder 抓未 normalize 的 reward
+        if ep_summary is not None:
+            info["ep_summary"] = ep_summary   # rebuilt 2026-06-14: per-episode CSV 用
+        return (self._encode_obs(s), reward, terminated, truncated, info)
 
     def close(self):
         self.bridge.close()

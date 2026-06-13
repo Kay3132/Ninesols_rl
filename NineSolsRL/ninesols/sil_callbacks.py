@@ -14,6 +14,7 @@ sil_callbacks.py —— SIL 用的兩個 SB3 callback。
 from __future__ import annotations
 
 import os
+import csv  # rebuilt 9046049: per-episode CSV
 from typing import Optional
 
 import numpy as np
@@ -167,3 +168,50 @@ def find_latest_sil_buffer(ckpt_dir: str, steps: int) -> Optional[str]:
     """找對應 PPO ckpt 步數的 sil_buffer pkl;沒有回 None。"""
     path = os.path.join(ckpt_dir, f"sil_buffer_{steps}_steps.pkl")
     return path if os.path.exists(path) else None
+
+
+class EpisodeCSVCallback(BaseCallback):
+    """rebuilt 9046049 2026-06-14: 每場 episode 寫一列到 episodes.csv。
+
+    env.py 在 episode 結束時把摘要放進 info["ep_summary"];這裡補上全域步數
+    `total_timesteps`(= self.num_timesteps,續訓時從 ckpt 接續、正確)後寫一列。
+    檔案放在跟 PPO progress.csv 同一個 logger 資料夾(self.model.logger.dir),
+    兩檔都用步數當 key → 可直接 join 對齊「某 PPO iteration 區間的 episode 表現」。
+    單 env(DummyVecEnv num_envs=1)版本。
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self._writer = None
+        self._fh = None
+        self._path: Optional[str] = None
+
+    def _ensure_writer(self, summary: dict) -> None:
+        if self._writer is not None:
+            return
+        # logger.dir 在 train.py set_logger 後才有 → 第一場才 lazy-open
+        log_dir = getattr(self.model.logger, "dir", None) or "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        self._path = os.path.join(log_dir, "episodes.csv")
+        self._fh = open(self._path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow(["total_timesteps", *summary.keys()])
+        self._fh.flush()
+        if self.verbose >= 1:
+            print(f"[ep-csv] per-episode metrics → {self._path}")
+
+    def _on_step(self) -> bool:
+        info = self.locals["infos"][0]
+        done = bool(self.locals["dones"][0])
+        if done and isinstance(info, dict) and "ep_summary" in info:
+            summary = info["ep_summary"]
+            self._ensure_writer(summary)
+            self._writer.writerow([self.num_timesteps, *summary.values()])
+            self._fh.flush()   # 即時落地，訓練中途崩潰也保住已寫的列
+        return True
+
+    def _on_training_end(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+            self._writer = None

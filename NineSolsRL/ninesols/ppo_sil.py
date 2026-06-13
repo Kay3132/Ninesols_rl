@@ -30,7 +30,7 @@ from .sil_buffer import SILBuffer
 DEFAULT_SIL_CFG = dict(
     n_updates=4,         # 每次 PPO 更新後跑幾次 SIL minibatch
     batch_size=256,
-    coef=0.03,           # SIL 損失整體權重(穩態值)。2026-05-26 從 0.1 砍到 0.03:
+    coef=0.02,           # rebuilt 326898c 2026-06-13: 0.03 → 0.02。SIL 損失整體權重(穩態值)。2026-05-26 從 0.1 砍到 0.03:
                          # 觀察 sil/policy_loss=18 × 0.1 = 1.8 vs PPO policy_grad_loss=-0.017
                          # → SIL/PPO 比 ~100x,SIL 主宰 → policy 被舊 WIN 拖、PPO 訊號淹沒
                          # 砍到 0.03 後比例 ~30x,讓 PPO rollout 訊號能 push back
