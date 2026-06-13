@@ -1,738 +1,1141 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using BepInEx;
-using UnityEngine;
+using BepInEx.Logging;
 using HarmonyLib;
+using UnityEngine;
 
-namespace NineSolsRL
+namespace NineSolsRL;
+
+[BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "2.0.0")]
+public class Plugin : BaseUnityPlugin
 {
-    [BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "2.0.0")]
-    public class Plugin : BaseUnityPlugin
-    {
-        public static Plugin Instance;
-        internal static BepInEx.Logging.ManualLogSource Log;   // 純 managed logger，不受 Unity 物件狀態影響
+	[HarmonyPatch(typeof(GameCore), "Update")]
+	public static class PatchGameCoreUpdate
+	{
+		private static void Postfix()
+		{
+			Instance?.OnGameUpdate();
+		}
+	}
 
-        private NetworkStream _stream;
-        private TcpClient _pendingClient;
-        private Task _connectTask;
-        private bool _connected = false;
+	[HarmonyPatch(typeof(Player), "HorizontalMoveCheck")]
+	public static class PatchHorizontalMoveCheck
+	{
+		private static int _logTick;
 
-        // ---- RL action 狀態 ----
-        // move:   -1 左, 0 停, 1 右
-        // dodge:  0 無 / 1 跳 / 2 衝刺
-        // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符 / 5 喝藥
-        private int _moveDir = 0;
-        private int _jumpPulse, _dashPulse, _meleePulse, _rangedPulse, _parryPulse, _talismanPulse, _healPulse;
-        private const int PULSE = 3;                    // 離散動作維持的幀數
+		private static void Postfix(Player __instance)
+		{
+			_hmcCalls++;
+			Plugin instance = Instance;
+			if (instance != null && instance._connected && __instance != null && IsPlayerControllable(__instance))
+			{
+				int moveDir = instance._moveDir;
+				float num;
+				try
+				{
+					num = __instance.MaxRunStat.Value;
+				}
+				catch
+				{
+					num = 8f;
+				}
+				if (moveDir != 0)
+				{
+					__instance.moveX = moveDir;
+					((PhysicsMover)__instance).VelX = num * (float)moveDir;
+				}
+				else
+				{
+					__instance.moveX = 0;
+				}
+			}
+		}
+	}
 
-        // curriculum：boss 有效 HP 壓到 _bossHpScale × maxHP（1.0 = 不弱化）
-        private float _bossHpScale = 1.0f;
+	[HarmonyPatch(typeof(ParriableAttackEffect), "EffectParried")]
+	public static class PatchEffectParried
+	{
+		private static void Postfix(ParryResultData data)
+		{
+			//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+			Plugin instance = Instance;
+			if (instance == null)
+			{
+				return;
+			}
+			try
+			{
+				instance._lastParryResult = ((!data.isAccurate) ? 1 : 2);
+				instance._parryCount++;
+			}
+			catch
+			{
+			}
+		}
+	}
 
-        // hard reset：呼叫 Player.Suicide() → memory mode 下死亡會自動重啟此場 boss 戰
-        private float _lastResetTime = 0f;
+	[HarmonyPatch(typeof(PlayerParryState), "OnStateEnter")]
+	public static class PatchParryEnter
+	{
+		private static void Postfix()
+		{
+			Plugin instance = Instance;
+			if (instance == null)
+			{
+				return;
+			}
+			try
+			{
+				instance._parryEnterCount++;
+			}
+			catch
+			{
+			}
+		}
+	}
 
-        // 診斷：上次 boss 偵測結果（給 [RL] log 用）
-        private string _lastBossInfo = "none";
+	public static Plugin Instance;
 
-        // 格檔：_lastParryResult 0 無 / 1 不精確 / 2 精確；_parryCount 累計成功格檔次數（reward 用）
-        private int _lastParryResult = 0;
-        private int _parryCount = 0;
+	internal static ManualLogSource Log;
 
-        // v2.0.0 dev flag：開著時每次 boss FSM 字串變動就印一行 [boss-fsm] log，
-        // 用來收集介川 / 黃裳等 boss 的所有招式 FSM 字串，整理後填到
-        // _bossFsmCategories 對映表。production build 應改回 false。
-        // 邊訓邊熱補策略：保留 true，訓練期間 grep log 抓新字串。
-        private const bool LOG_BOSS_FSM = true;
-        private string _lastLoggedBossFsm = null;
+	private NetworkStream _stream;
 
-        // v2.0.0 通用攻擊類別查表：每個 boss 一張 FSM 字串 → category 的表
-        // 8 個通用 category（boss-agnostic）：
-        //   0 idle / 1 parryable_windup / 2 unparryable_windup / 3 grab_windup
-        //   4 ranged_windup / 5 attacking / 6 phase_change / 7 stunned
-        // 未知 FSM fallback 到 0 (idle)。
-        // Key 用 Unity 物件全名（含 StealthGameMonster_Boss_ 前綴），匹配最直接零歧義。
-        private static readonly Dictionary<string, Dictionary<string, int>> _bossFsmCategories
-            = new Dictionary<string, Dictionary<string, int>>
-        {
-            ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
-            {
-                // category:0 idle / 1 parryable_windup / 5 attacking / 7 stunned
-                ["Attack1"]       = 5,  // attacking
-                ["Attack2"]       = 5,  // attacking
-                ["Attack3"]       = 5,  // attacking
-                ["Attack4"]       = 5,  // attacking
-                ["Attack5"]       = 5,  // attacking
-                ["Attack6"]       = 5,  // attacking
-                ["Attack7"]       = 5,  // attacking
-                ["Attack8"]       = 5,  // attacking
-                ["Attack9"]       = 5,  // attacking
-                ["Attack10"]      = 5,  // attacking
-                ["Attack11"]      = 5,  // attacking
-                ["Attack12"]      = 5,  // attacking
-                ["Attack13"]      = 5,  // attacking
-                ["Attack14"]      = 5,  // attacking
-                ["Engaging"]      = 0,  // idle:接近 / 走位
-                ["Hurt_Big"]      = 7,  // stunned:boss 被大傷硬直
-                ["PostureBreak"]  = 7,  // stunned:架勢崩潰,deathblow 機會 
-                ["PreAttack"]     = 1,  // parryable_windup:前置攻擊
-                ["TurnAround"]    = 0,  // idle:轉身
-                ["Undefined"]     = 0,  // idle:FSM 過渡(顯式登錄)
-                ["WanderingIdle"] = 0,  // idle:閒晃(顯式登錄)
-                ["LastHit"]       = 5,  // 2026-05-27: 觀察大量 Explosion unparriable hitbox → 攻擊類
-                                        //              動態 isUnparriable 偵測會把 cat=5 override 成 cat=2
-                // ---- TBD----
-                // ["BossAngry"] // 是否有無敵幀/紅光?選 0/1/6
-                //                  觀察:偶見 boss children active=1(boss 自傷反應),不是紅光 → 維持 0
-            },
-            // 未來新 boss：加 entry。例：
-            // ["StealthGameMonster_Boss_HuangShang"] = new Dictionary<string, int> { ... },
-        };
+	private TcpClient _pendingClient;
 
-        // v2.0.0 每個 boss 的總階段數（NEAR 判定用：phase_count >= total_phases 才算最終階段）
-        // 未知 boss fallback 1（無 phase gating，等同單階段 boss）。
-        private static readonly Dictionary<string, int> _bossTotalPhases
-            = new Dictionary<string, int>
-        {
-            ["StealthGameMonster_Boss_JieChuan"] = 2,
-            // ["StealthGameMonster_Boss_HuangShang"] = 3,
-        };
+	private Task _connectTask;
 
-        // v2.0.0 per-boss attack ID 表(平行 _bossFsmCategories,給 policy 細粒度區分同 boss 內
-        // 不同 attack# 的能力)。slot 0~MAX_ATTACK_IDS-1,語意 per-boss 各自定義。
-        // 未登錄 boss / 未登錄 FSM → attack_id = -1 (env.py one-hot 全 0,表示「非特定 attack」)。
-        public const int MAX_ATTACK_IDS = 20;
-        private static readonly Dictionary<string, Dictionary<string, int>> _bossAttackIds
-            = new Dictionary<string, Dictionary<string, int>>
-        {
-            ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
-            {
-                ["PreAttack"]     = 0,
-                ["Attack1"]       = 1,
-                ["Attack2"]       = 2,
-                ["Attack3"]       = 3,
-                ["Attack4"]       = 4,
-                ["Attack5"]       = 5,
-                ["Attack6"]       = 6,
-                ["Attack7"]       = 7,
-                ["Attack8"]       = 8,
-                ["Attack9"]       = 9,
-                ["Attack11"]      = 10,
-                ["Attack12"]      = 11,
-                ["Attack14"]      = 12,
-                ["Hurt_Big"]      = 13,
-                ["PostureBreak"]  = 14,
-                ["LastHit"]       = 15,
-                // slot 16-19 留白給 phase 2 新 FSM
-            },
-        };
+	private bool _connected;
 
-        private int _debugTick = 0;
-        private float _lastStateTime = 0f;              // 上次送 state 的真實時間（穩定頻率用）
-        private float _lastGameTime  = 0f;              // 上次送 state 的遊戲時間（算 dt 用）
-        private const float SEND_INTERVAL = 1f / 30f;   // 固定 30Hz 送 state
+	private int _moveDir;
 
-        void Awake()
-        {
-            Instance = this;
-            Log = Logger;
-            DontDestroyOnLoad(this.gameObject);
-            Logger.LogInfo("NineSolsRL 啟動...");
-            var harmony = new Harmony("com.ninesolsrl.plugin");
-            harmony.PatchAll();
+	private int _jumpPulse;
 
-            // 手動 patch InControl.PlayerAction.WasPressed getter（注入跳/攻/閃/格檔）
-            try
-            {
-                var paType = AccessTools.TypeByName("InControl.PlayerAction");
-                if (paType != null)
-                {
-                    var getter = AccessTools.PropertyGetter(paType, "WasPressed");
-                    harmony.Patch(getter, postfix: new HarmonyMethod(
-                        typeof(Plugin).GetMethod(nameof(WasPressedPostfix),
-                            BindingFlags.Static | BindingFlags.NonPublic)));
-                    Logger.LogInfo("已 patch InControl.PlayerAction.WasPressed");
-                }
-                else
-                {
-                    Logger.LogError("找不到 InControl.PlayerAction 型別，離散動作將無法注入");
-                }
-            }
-            catch (Exception e) { Logger.LogError("InControl patch 失敗: " + e); }
-        }
+	private int _dashPulse;
 
-        // ============ Harmony patches ============
+	private int _meleePulse;
 
-        // 主迴圈：每幀跑一次
-        [HarmonyPatch(typeof(GameCore), "Update")]
-        public static class PatchGameCoreUpdate
-        {
-            static void Postfix() => Instance?.OnGameUpdate();
-        }
+	private int _rangedPulse;
 
-        // HMC 被呼叫的次數（無條件計數，用於診斷）
-        public static long _hmcCalls = 0;
+	private int _parryPulse;
 
-        // 移動注入：在遊戲算完水平移動後，直接覆蓋 moveX / VelX
-        [HarmonyPatch(typeof(Player), "HorizontalMoveCheck")]
-        public static class PatchHorizontalMoveCheck
-        {
-            private static int _logTick = 0;
-            static void Postfix(Player __instance)
-            {
-                _hmcCalls++;
-                var inst = Instance;
-                // 用 ReferenceEquals 做 null 檢查，避免 Unity 的 == 把已 destroy 的 plugin 當成 null
-                if (ReferenceEquals(inst, null) || !inst._connected) return;
-                if (ReferenceEquals(__instance, null)) return;
+	private int _talismanPulse;
 
-                // 守門：只有玩家「真正可操作」時才注入移動，
-                // 過場/劇情/傳送時讓遊戲完全掌控
-                if (!IsPlayerControllable(__instance)) return;
+	private int _healPulse;
 
-                int dir = inst._moveDir;
-                float maxRun;
-                try { maxRun = __instance.MaxRunStat.Value; } catch { maxRun = 8f; }
-                if (dir != 0)
-                {
-                    __instance.moveX = dir;
-                    __instance.VelX  = maxRun * dir;     // 直接給速度，繞過內部加速邏輯
-                }
-                else
-                {
-                    __instance.moveX = 0;                // 交給遊戲自然減速
-                }
+	private const int PULSE = 3;
 
-                if (++_logTick % 120 == 0)
-                    Log?.LogInfo($"[HMC] dir={dir} VelX={__instance.VelX:F1} " +
-                                 $"maxRun={maxRun:F1} state={__instance.CurrentStateType}");
-            }
-        }
+	private float _bossHpScale = 1f;
 
-        // 格檔結果偵測：玩家成功格檔時記錄精確/不精確
-        [HarmonyPatch(typeof(ParriableAttackEffect), "EffectParried")]
-        public static class PatchEffectParried
-        {
-            static void Postfix(ParryResultData data)
-            {
-                var inst = Instance;
-                if (ReferenceEquals(inst, null)) return;
-                try
-                {
-                    inst._lastParryResult = data.isAccurate ? 2 : 1;   // 精確=2 不精確=1
-                    inst._parryCount++;                                // 累計成功格檔
-                }
-                catch { }
-            }
-        }
+	private float _lastResetTime;
 
-        // 判斷玩家此刻是否真正可被玩家操作（過場/對話/劇情/傳送/死亡時為 false）
-        internal static bool IsPlayerControllable(Player p)
-        {
-            try
-            {
-                if (ReferenceEquals(p, null) || p == null) return false;
+	private string _lastBossInfo = "none";
 
-                // 輸入狀態必須是 Action（排除 對話/過場/UI/轉場/抽符 等）
-                var pib = p.playerInput;
-                if (pib == null || pib.currentStateType != PlayerInputStateType.Action) return false;
+	private int _lastParryResult;
 
-                if (p.CurrentStateType != PlayerStateType.Normal) return false;
-                if (p.IsScriptedMove) return false;
-                if (p.lockMoving) return false;
-                if (p.canMoveNode == null || !p.canMoveNode.gameObject.activeSelf) return false;
-                return true;
-            }
-            catch { return false; }
-        }
+	private int _parryCount;
 
-        // 受傷/倒地狀態：PlayerLieDownState / PlayerHurtState 的 OnStateUpdate 都會跑
-        // DodgeCheck()，所以這些狀態下「閃避」可以快速起身/翻滾脫離。
-        internal static bool IsHurtOrDown(Player p)
-        {
-            try
-            {
-                if (ReferenceEquals(p, null) || p == null) return false;
-                var st = p.CurrentStateType;
-                return st == PlayerStateType.LieDown
-                    || st == PlayerStateType.Hurt
-                    || st == PlayerStateType.HurtFlying;
-            }
-            catch { return false; }
-        }
+	public int _parryEnterCount;
 
-        // 離散動作注入：讓特定 PlayerAction 的 WasPressed 回傳 true
-        private static void WasPressedPostfix(object __instance, ref bool __result)
-        {
-            var inst = Instance;
-            if (ReferenceEquals(inst, null) || !inst._connected) return;
-            var acts = inst.GetActions();
-            if (acts == null) return;
-            var p = Player.i;
+	private const bool LOG_BOSS = true;
 
-            if (IsPlayerControllable(p))
-            {
-                // 正常可操作：所有動作都放行
-                if      (inst._jumpPulse     > 0 && ReferenceEquals(__instance, acts.Jump))         __result = true;
-                else if (inst._dashPulse     > 0 && ReferenceEquals(__instance, acts.Dodge))        __result = true;
-                else if (inst._meleePulse    > 0 && ReferenceEquals(__instance, acts.Attack))       __result = true;
-                else if (inst._rangedPulse   > 0 && ReferenceEquals(__instance, acts.WeaponAttack)) __result = true;
-                else if (inst._parryPulse    > 0 && ReferenceEquals(__instance, acts.Parry))        __result = true;
-                else if (inst._talismanPulse > 0 && ReferenceEquals(__instance, acts.FooAttack))    __result = true;
-                else if (inst._healPulse     > 0 && ReferenceEquals(__instance, acts.Heal))         __result = true;
-            }
-            else if (IsHurtOrDown(p))
-            {
-                // 受傷/倒地：只放行「閃避」用來快速起身；其餘動作遊戲本來就會擋
-                if (inst._dashPulse > 0 && ReferenceEquals(__instance, acts.Dodge)) __result = true;
-            }
-        }
+	private string _lastLoggedBossSig;
 
-        private PlayerGamePlayActionSet _cachedActions;
-        private PlayerGamePlayActionSet GetActions()
-        {
-            if (_cachedActions != null) return _cachedActions;
-            try
-            {
-                var p = Player.i;
-                if (p == null) return null;
-                var pib = p.playerInput;
-                if (pib == null) return null;
-                _cachedActions = pib.gameplayActions;   // gameplayActions 在整場遊戲中固定，可永久快取
-            }
-            catch { }
-            return _cachedActions;
-        }
+	private static readonly Dictionary<string, Dictionary<string, int>> _bossFsmCategories = new Dictionary<string, Dictionary<string, int>> { ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
+	{
+		["Attack1"] = 5,
+		["Attack2"] = 5,
+		["Attack3"] = 5,
+		["Attack4"] = 5,
+		["Attack5"] = 5,
+		["Attack6"] = 5,
+		["Attack7"] = 5,
+		["Attack8"] = 5,
+		["Attack9"] = 5,
+		["Attack10"] = 5,
+		["Attack11"] = 5,
+		["Attack12"] = 5,
+		["Attack13"] = 5,
+		["Attack14"] = 5,
+		["Engaging"] = 0,
+		["Hurt_Big"] = 7,
+		["PostureBreak"] = 7,
+		["PreAttack"] = 1,
+		["TurnAround"] = 0,
+		["Undefined"] = 0,
+		["WanderingIdle"] = 0,
+		["LastHit"] = 5
+	} };
 
-        // ============ 主迴圈 ============
+	private static readonly Dictionary<string, int> _bossTotalPhases = new Dictionary<string, int> { ["StealthGameMonster_Boss_JieChuan"] = 2 };
 
-        public void OnGameUpdate()
-        {
-            _debugTick++;
+	private static readonly Dictionary<string, Dictionary<string, int>> _bossStatePhaseIndex = new Dictionary<string, Dictionary<string, int>> { ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
+	{
+		["PreAttack"] = 1,
+		["Attack1"] = 1,
+		["Attack2"] = 1,
+		["Attack3"] = 1,
+		["Attack4"] = 1,
+		["Attack5"] = 1,
+		["Attack6"] = 1,
+		["Attack7"] = 1,
+		["Attack8"] = 1,
+		["Attack9"] = 1,
+		["Attack10"] = 1,
+		["Engaging"] = 1,
+		["TurnAround"] = 1,
+		["WanderingIdle"] = 1,
+		["Undefined"] = 1,
+		["Hurt_Big"] = 1,
+		["Attack11"] = 2,
+		["Attack12"] = 2,
+		["Attack13"] = 2,
+		["Attack14"] = 2,
+		["LastHit"] = 2,
+		["PostureBreak"] = 2
+	} };
 
-            // 遞減離散動作脈衝
-            if (_jumpPulse     > 0) _jumpPulse--;
-            if (_dashPulse     > 0) _dashPulse--;
-            if (_meleePulse    > 0) _meleePulse--;
-            if (_rangedPulse   > 0) _rangedPulse--;
-            if (_parryPulse    > 0) _parryPulse--;
-            if (_talismanPulse > 0) _talismanPulse--;
-            if (_healPulse     > 0) _healPulse--;
+	private static readonly HashSet<string> _warnedMissingTotalPhaseBoss = new HashSet<string>();
 
-            if (!_connected) { TryConnect(); return; }
+	private static readonly HashSet<string> _warnedMissingPhaseMapBoss = new HashSet<string>();
 
-            // 讀取 Python 傳來的 action（非阻塞）
-            try
-            {
-                if (_stream?.DataAvailable == true)
-                {
-                    var buf = new byte[4096];
-                    int n = _stream.Read(buf, 0, buf.Length);
-                    if (n > 0) ParseAction(Encoding.UTF8.GetString(buf, 0, n));
-                    else { Disconnect(); return; }
-                }
-            }
-            catch { Disconnect(); return; }
+	private static readonly HashSet<string> _warnedMissingPhaseState = new HashSet<string>();
 
-            // 綁真實時間送 state（固定 30Hz，不隨 fps 浮動）；
-            // dt 用「遊戲時間」算 → 之後遊戲加速時，reward 仍能正確換算
-            if (Time.unscaledTime - _lastStateTime >= SEND_INTERVAL)
-            {
-                float dt = Time.time - _lastGameTime;
-                _lastGameTime  = Time.time;
-                _lastStateTime = Time.unscaledTime;
-                var state = GetGameState(dt);
-                if (state != null) SendState(state);
-            }
+	public const int MAX_ATTACK_IDS = 20;
 
-            // [RL] periodic tick log 註解掉(訓練期不需,log 太雜)
-            //if (_debugTick % 120 == 0)
-            //{
-            //    var p = Player.i;
-            //    string st = "null";
-            //    try { if (p != null) st = p.CurrentStateType.ToString(); } catch { }
-            //    Logger.LogInfo($"[RL] tick={_debugTick} move={_moveDir} " +
-            //                   $"jump={_jumpPulse} dash={_dashPulse} melee={_meleePulse} " +
-            //                   $"ranged={_rangedPulse} parry={_parryPulse} talis={_talismanPulse} " +
-            //                   $"heal={_healPulse} bossHpScale={_bossHpScale:F2} " +
-            //                   $"boss={_lastBossInfo} state={st}");
-            //}
-        }
+	private static readonly Dictionary<string, Dictionary<string, int>> _bossAttackIds = new Dictionary<string, Dictionary<string, int>> { ["StealthGameMonster_Boss_JieChuan"] = new Dictionary<string, int>
+	{
+		["PreAttack"] = 0,
+		["Attack1"] = 1,
+		["Attack2"] = 2,
+		["Attack3"] = 3,
+		["Attack4"] = 4,
+		["Attack5"] = 5,
+		["Attack6"] = 6,
+		["Attack7"] = 7,
+		["Attack8"] = 8,
+		["Attack9"] = 9,
+		["Attack11"] = 10,
+		["Attack12"] = 11,
+		["Attack14"] = 12,
+		["Hurt_Big"] = 13,
+		["PostureBreak"] = 14,
+		["LastHit"] = 15
+	} };
 
-        private void TryConnect()
-        {
-            if (_debugTick < 300) return;
+	private int _debugTick;
 
-            if (_connectTask != null)
-            {
-                if (!_connectTask.IsCompleted) return;
+	private float _lastStateTime;
 
-                if (!_connectTask.IsFaulted && _pendingClient != null && _pendingClient.Connected)
-                {
-                    Logger.LogInfo("已連線到 Python！");
-                    _stream = _pendingClient.GetStream();
-                    _connected = true;
-                }
-                else
-                {
-                    Logger.LogInfo($"connect 失敗 (tick={_debugTick})，重試中...");
-                    try { _pendingClient?.Close(); } catch { }
-                    _pendingClient = null;
-                }
-                _connectTask = null;
-                return;
-            }
+	private float _lastGameTime;
 
-            if (_debugTick % 180 != 0) return;
+	private const float SEND_INTERVAL = 1f / 30f;
 
-            Logger.LogInfo($"ConnectAsync 127.0.0.1:19271 (tick={_debugTick})...");
-            _pendingClient = new TcpClient();
-            try { _connectTask = _pendingClient.ConnectAsync("127.0.0.1", 19271); }
-            catch (Exception ex)
-            {
-                Logger.LogInfo("ConnectAsync 例外: " + ex.Message);
-                _pendingClient = null;
-            }
-        }
+	public static long _hmcCalls = 0L;
 
-        private void Disconnect()
-        {
-            _moveDir = 0;
-            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = _healPulse = 0;
-            Logger.LogInfo("Python 斷線，重新嘗試連線...");
-            try { _stream?.Close(); } catch { }
-            try { _pendingClient?.Close(); } catch { }
-            _stream = null;
-            _pendingClient = null;
-            _connectTask = null;
-            _connected = false;
-        }
+	private PlayerGamePlayActionSet _cachedActions;
 
-        private string GetGameState(float dt)
-        {
-            try
-            {
-                var player = Player.i;
-                if (player == null) return null;
-                var ph = player.GetComponentInChildren<PlayerHealth>(true);
-                if (ph == null) return null;
+	private static bool TryReadShieldInfo(MonsterBase boss, out bool hasShieldObj, out bool shieldActive, out float shieldCur, out float shieldMax)
+	{
+		hasShieldObj = false;
+		shieldActive = false;
+		shieldCur = 0f;
+		shieldMax = 0f;
+		if (boss == null || (Object)(object)boss == (Object)null)
+		{
+			return false;
+		}
+		try
+		{
+			MonsterShield currentShield = boss.currentShield;
+			if (currentShield == null || (Object)(object)currentShield == (Object)null)
+			{
+				return true;
+			}
+			hasShieldObj = true;
+			shieldActive = ((Behaviour)currentShield).isActiveAndEnabled && (Object)(object)((Component)currentShield).gameObject != (Object)null && ((Component)currentShield).gameObject.activeInHierarchy;
+			shieldCur = currentShield.ShieldCurrentHP;
+			shieldMax = currentShield.ShieldMaxHP;
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
 
-                // ---- 玩家 ----
-                float px = player.transform.position.x;
-                float py = player.transform.position.y;
-                float vx = player.VelX;                          // 真實速度（非差分）
-                float vy = player.VelY;
-                float facing  = player.Facing == Facings.Right ? 1f : -1f;
-                bool  grounded = false;
-                try { grounded = player.IsOnGround; } catch { }
-                float php    = ph.CurrentHealthValue;
-                float phpPct = 0f; try { phpPct = ph.percentage; } catch { }
-                float injury = 0f; try { injury = ph.CurrentInternalInjury; } catch { }   // 內傷
+	private void Awake()
+	{
+		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0027: Expected O, but got Unknown
+		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0073: Expected O, but got Unknown
+		Instance = this;
+		Log = ((BaseUnityPlugin)this).Logger;
+		Object.DontDestroyOnLoad((Object)(object)((Component)this).gameObject);
+		Harmony val = new Harmony("com.ninesolsrl.plugin");
+		val.PatchAll();
+		try
+		{
+			Type type = AccessTools.TypeByName("InControl.OneAxisInputControl");
+			if (type != null)
+			{
+				MethodInfo methodInfo = AccessTools.PropertyGetter(type, "WasPressed");
+				val.Patch((MethodBase)methodInfo, (HarmonyMethod)null, new HarmonyMethod(typeof(Plugin).GetMethod("WasPressedPostfix", BindingFlags.Static | BindingFlags.NonPublic)), (HarmonyMethod)null, (HarmonyMethod)null, (HarmonyMethod)null);
+			}
+			else
+			{
+				((BaseUnityPlugin)this).Logger.LogError((object)"找不到 InControl.OneAxisInputControl 型別，離散動作將無法注入");
+			}
+		}
+		catch (Exception ex)
+		{
+			((BaseUnityPlugin)this).Logger.LogError((object)("InControl patch 失敗: " + ex));
+		}
+	}
 
-                // 氣（Qi）—— 回血與貼符共用的資源
-                float qi = 0f, qiMax = 1f, qiPct = 0f;
-                try
-                {
-                    var en = player.ammo;
-                    if (en != null) { qi = en.Value; qiMax = en.MaxValue; qiPct = en.percentage; }
-                }
-                catch { }
+	internal static bool IsPlayerControllable(Player p)
+	{
+		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002d: Unknown result type (might be due to invalid IL or missing references)
+		try
+		{
+			if (p == null || (Object)(object)p == (Object)null)
+			{
+				return false;
+			}
+			PlayerInputBinder playerInput = p.playerInput;
+			if ((Object)(object)playerInput == (Object)null || (int)playerInput.currentStateType != 0)
+			{
+				return false;
+			}
+			if ((int)p.CurrentStateType != 0)
+			{
+				return false;
+			}
+			if (p.IsScriptedMove)
+			{
+				return false;
+			}
+			if (p.lockMoving)
+			{
+				return false;
+			}
+			if ((Object)(object)p.canMoveNode == (Object)null || !((Component)p.canMoveNode).gameObject.activeSelf)
+			{
+				return false;
+			}
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
 
-                // ---- boss 偵測 ----
-                float bx = 0, by = 0, bvx = 0, bvy = 0, bFacing = 0, bhp = 0, bhpPct = 0, bhpMax = 0;
-                int bossFsm = 0;
-                int attackCategory = 0;   // v2.0.0：通用攻擊類別（0-7），未知 boss/FSM 預設 idle
-                int totalPhases = 1;      // v2.0.0：boss 總階段數，未知 boss 預設 1
-                int attackId = -1;        // v2.0.0：per-boss attack ID（0~MAX_ATTACK_IDS-1），未登錄 = -1
-                bool bossPresent = false, bossDead = false;
+	internal static bool IsHurtOrDown(Player p)
+	{
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001a: Invalid comparison between Unknown and I4
+		//IL_001c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001f: Invalid comparison between Unknown and I4
+		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0024: Invalid comparison between Unknown and I4
+		try
+		{
+			if (p == null || (Object)(object)p == (Object)null)
+			{
+				return false;
+			}
+			PlayerStateType currentStateType = p.CurrentStateType;
+			return (int)currentStateType == 33 || (int)currentStateType == 26 || (int)currentStateType == 41;
+		}
+		catch
+		{
+			return false;
+		}
+	}
 
-                // 主要：遊戲權威的「當前 boss 血條」→ PostureSystem → MonsterBase
-                MonsterBase boss = null;
-                string bossSrc = "none";
-                try
-                {
-                    var hpUI = GameCore.Instance != null ? GameCore.Instance.monsterHpUI : null;
-                    var bossHpUI = hpUI != null ? hpUI.CurrentBossHP : null;
-                    if (bossHpUI != null && bossHpUI.bindingPosture != null)
-                    {
-                        boss = bossHpUI.bindingPosture.BindMonster;
-                        if (boss != null) bossSrc = "ui";
-                    }
-                }
-                catch { }
-                // 後備：UI 沒給 boss 血條 → 掃場上等級最高的怪
-                if (boss == null)
-                {
-                    int bestLevel = int.MinValue;
-                    foreach (var m in FindObjectsOfType<MonsterBase>())
-                    {
-                        if (m == null) continue;
-                        int lvl = 0;
-                        try { lvl = (int)m.monsterStat.monsterLevel; } catch { }
-                        if (lvl > bestLevel) { bestLevel = lvl; boss = m; }
-                    }
-                    if (boss != null) bossSrc = "scan";
-                }
-                _lastBossInfo = boss != null ? boss.name + "(" + bossSrc + ")" : "none";
-                if (boss != null)
-                {
-                    bx = boss.transform.position.x;
-                    by = boss.transform.position.y;
-                    try { bvx = boss.VelX; bvy = boss.VelY; } catch { }
-                    try { bFacing = boss.Facing == Facings.Right ? 1f : -1f; } catch { }
-                    try
-                    {
-                        // boss 真實血量 = PostureSystem（架勢系統），不是 MonsterBase.health
-                        var ps = boss.postureSystem;
-                        float maxHp = ps.MaxPostureValue;
-                        bhpMax = maxHp;                              // 未縮放滿血
-                        float cap = _bossHpScale * maxHp;
-                        // curriculum：把 posture 壓到 cap = scale × maxHP
-                        if (_bossHpScale < 1f && ps.PostureValue > cap)
-                            ps.SetPostureValue((int)cap);
-                        float remain = ps.RemainTotal;               // posture + 內傷 = 目前血量
-                        bhp = remain;
-                        // bhp_pct 相對於 cap 回報 → 不論難度 boss 都「從 100% 開始」
-                        bhpPct = cap > 0f ? Mathf.Clamp01(remain / cap) : 0f;
-                    }
-                    catch { }
-                    // v2.0.0 通用攻擊類別查表：取代舊的 bWindup/bAttacking substring 啟發式。
-                    // 未登錄 boss → fallback idle (0)、totalPhases=1
-                    // 未登錄 FSM → fallback idle (0)
-                    try
-                    {
-                        var cs = boss.CurrentState;
-                        bossFsm = (int)cs;
-                        string csName = cs.ToString();
-                        string bossName = boss.name;
+	private static void WasPressedPostfix(object __instance, ref bool __result)
+	{
+		Plugin instance = Instance;
+		if (instance == null || !instance._connected)
+		{
+			return;
+		}
+		PlayerGamePlayActionSet actions = instance.GetActions();
+		if (actions == null)
+		{
+			return;
+		}
+		Player i = Player.i;
+		if (IsPlayerControllable(i))
+		{
+			if (instance._jumpPulse > 0 && __instance == actions.Jump)
+			{
+				__result = true;
+			}
+			else if (instance._dashPulse > 0 && __instance == actions.Dodge)
+			{
+				__result = true;
+			}
+			else if (instance._meleePulse > 0 && __instance == actions.Attack)
+			{
+				__result = true;
+			}
+			else if (instance._rangedPulse > 0 && __instance == actions.WeaponAttack)
+			{
+				__result = true;
+			}
+			else if (instance._parryPulse > 0 && __instance == actions.Parry)
+			{
+				__result = true;
+			}
+			else if (instance._talismanPulse > 0 && __instance == actions.FooAttack)
+			{
+				__result = true;
+			}
+			else if (instance._healPulse > 0 && __instance == actions.Heal)
+			{
+				__result = true;
+			}
+		}
+		else if (IsHurtOrDown(i) && instance._dashPulse > 0 && __instance == actions.Dodge)
+		{
+			__result = true;
+		}
+	}
 
-                        if (_bossFsmCategories.TryGetValue(bossName, out var fsmMap)
-                            && fsmMap.TryGetValue(csName, out int cat))
-                        {
-                            attackCategory = cat;
-                        }
-                        _bossTotalPhases.TryGetValue(bossName, out totalPhases);
-                        if (totalPhases <= 0) totalPhases = 1;
+	private PlayerGamePlayActionSet GetActions()
+	{
+		if (_cachedActions != null)
+		{
+			return _cachedActions;
+		}
+		try
+		{
+			Player i = Player.i;
+			if ((Object)(object)i == (Object)null)
+			{
+				return null;
+			}
+			PlayerInputBinder playerInput = i.playerInput;
+			if ((Object)(object)playerInput == (Object)null)
+			{
+				return null;
+			}
+			_cachedActions = playerInput.gameplayActions;
+		}
+		catch
+		{
+		}
+		return _cachedActions;
+	}
 
-                        // v2.0.0 per-boss attack ID 查表(細粒度,跟 attack_category 並存)
-                        if (_bossAttackIds.TryGetValue(bossName, out var atkMap)
-                            && atkMap.TryGetValue(csName, out int aid))
-                        {
-                            attackId = aid;
-                        }
+	public void OnGameUpdate()
+	{
+		_debugTick++;
+		if (_jumpPulse > 0)
+		{
+			_jumpPulse--;
+		}
+		if (_dashPulse > 0)
+		{
+			_dashPulse--;
+		}
+		if (_meleePulse > 0)
+		{
+			_meleePulse--;
+		}
+		if (_rangedPulse > 0)
+		{
+			_rangedPulse--;
+		}
+		if (_parryPulse > 0)
+		{
+			_parryPulse--;
+		}
+		if (_talismanPulse > 0)
+		{
+			_talismanPulse--;
+		}
+		if (_healPulse > 0)
+		{
+			_healPulse--;
+		}
+		if (!_connected)
+		{
+			TryConnect();
+			return;
+		}
+		try
+		{
+			NetworkStream stream = _stream;
+			if (stream != null && stream.DataAvailable)
+			{
+				byte[] array = new byte[4096];
+				int num = _stream.Read(array, 0, array.Length);
+				if (num <= 0)
+				{
+					Disconnect();
+					return;
+				}
+				ParseAction(Encoding.UTF8.GetString(array, 0, num));
+			}
+		}
+		catch
+		{
+			Disconnect();
+			return;
+		}
+		if (Time.unscaledTime - _lastStateTime >= 1f / 30f)
+		{
+			float dt = Time.time - _lastGameTime;
+			_lastGameTime = Time.time;
+			_lastStateTime = Time.unscaledTime;
+			string gameState = GetGameState(dt);
+			if (gameState != null)
+			{
+				SendState(gameState);
+			}
+		}
+	}
 
-                        // v2.0.0 unparryable 偵測(scene-wide):掃整個 scene 的 DamageDealer。
-                        // 為什麼不用 boss.GetComponentsInChildren:介川的真正 hitbox 在 scene root
-                        // 動態 spawn,不在 boss 子物件樹下。boss children 永遠 act=0。
-                        // 改用 FindObjectsOfType 搜 scene 中所有 active+!parriable+MonsterAttack 的 DD。
-                        // flag 位置驗證:DamageDealer.cs:446 `public bool parriable = true`
-                        // 使用點:ParriableAttackEffect.cs:157 `if (!component.parriable) return false`
-                        bool isUnparriable = false;
-                        int sceneMonAct = 0, sceneMonUnp = 0;
-                        var sceneUnpNames = new System.Collections.Generic.List<string>();
-                        try
-                        {
-                            var allDD = UnityEngine.Object.FindObjectsOfType<DamageDealer>();
-                            foreach (var dd in allDD)
-                            {
-                                if (dd == null || !dd.isActiveAndEnabled) continue;
-                                if (dd.type != DamageType.MonsterAttack) continue;
-                                sceneMonAct++;
-                                if (!dd.parriable)
-                                {
-                                    sceneMonUnp++;
-                                    sceneUnpNames.Add(dd.gameObject.name);
-                                    isUnparriable = true;
-                                }
-                            }
-                        }
-                        catch { }
-                        // 2026-05-27: 殘留紅光 hitbox 修法 —— 放寬 override 條件
-                        // 觀察到 attack 結束後 FSM 已切到 idle/turn/preattack（WanderingIdle 79 次、
-                        // TurnAround 38 次、PreAttack 22 次 in 1 session），但 explosion DamageDealer
-                        // 還沒清掉 → policy 看到 cat=0/1 沒警告 → 被殘留紅光炸。
-                        // 放寬：任何 FSM 配 scene 紅光都 override 成 cat=2，
-                        // 讓「場上有紅光」這個 universal 警告訊號優先於 FSM 語義。
-                        if (isUnparriable)
-                        {
-                            attackCategory = 2;   // unparryable_windup slot 重用為 "unparryable attack"
-                        }
+	private void TryConnect()
+	{
+		if (_debugTick < 300)
+		{
+			return;
+		}
+		if (_connectTask != null)
+		{
+			if (!_connectTask.IsCompleted)
+			{
+				return;
+			}
+			if (!_connectTask.IsFaulted && _pendingClient != null && _pendingClient.Connected)
+			{
+				_stream = _pendingClient.GetStream();
+				_connected = true;
+			}
+			else
+			{
+				try
+				{
+					_pendingClient?.Close();
+				}
+				catch
+				{
+				}
+				_pendingClient = null;
+			}
+			_connectTask = null;
+		}
+		else if (_debugTick % 180 == 0)
+		{
+			_pendingClient = new TcpClient();
+			try
+			{
+				_connectTask = _pendingClient.ConnectAsync("127.0.0.1", 19271);
+			}
+			catch (Exception)
+			{
+				_pendingClient = null;
+			}
+		}
+	}
 
-                        // dev：FSM 字串變動時印一行，邊訓邊收集新字串（未在 _bossFsmCategories 內 → 補表）
-                        if (LOG_BOSS_FSM && csName != _lastLoggedBossFsm)
-                        {
-                            // diagnostic:同時印 boss-children + scene-wide 兩種統計
-                            int ddAll = 0, ddActive = 0;
-                            try
-                            {
-                                var all = boss.GetComponentsInChildren<DamageDealer>(true);
-                                ddAll = all.Length;
-                                foreach (var dd in all)
-                                {
-                                    if (dd != null && dd.isActiveAndEnabled) ddActive++;
-                                }
-                            }
-                            catch { }
-                            Logger.LogInfo($"[boss-fsm] name={bossName} fsm={csName} (int={bossFsm}) cat={attackCategory} " +
-                                           $"DD bossAll={ddAll} bossAct={ddActive} | " +
-                                           $"scene MonAct={sceneMonAct} MonUnp={sceneMonUnp} " +
-                                           $"unp=[{string.Join(",", sceneUnpNames)}]");
-                            _lastLoggedBossFsm = csName;
-                        }
-                    }
-                    catch { }
-                    // 真死才 true；換階段 (BossPhaseChangeState) 時 IsDead() 為 false
-                    // → 2 階段 boss 不會在一階清掉時誤判 done
-                    try { bossDead = boss.IsDead(); }
-                    catch { }
-                    bossPresent = true;
-                }
-                float bdx = bossPresent ? bx - px : 0f;          // 相對位置
-                float bdy = bossPresent ? by - py : 0f;
+	private void Disconnect()
+	{
+		_moveDir = 0;
+		_jumpPulse = (_dashPulse = (_meleePulse = (_rangedPulse = (_parryPulse = (_talismanPulse = (_healPulse = 0))))));
+		try
+		{
+			_stream?.Close();
+		}
+		catch
+		{
+		}
+		try
+		{
+			_pendingClient?.Close();
+		}
+		catch
+		{
+		}
+		_stream = null;
+		_pendingClient = null;
+		_connectTask = null;
+		_connected = false;
+	}
 
-                bool done = (php <= 0) || bossDead;
-                // reset 後 3 秒內強制 controllable=false → 確保 Python reset 迴圈會等
-                // 完整個場景重載（fade + load + 進場動畫），不會在舊場景提早 break
-                bool controllable = IsPlayerControllable(player)
-                                    && (Time.time - _lastResetTime > 3f);
-                bool knockedDown  = IsHurtOrDown(player);   // 受傷/倒地（可用閃避起身）
-                string state = player.CurrentStateType.ToString();
+	private string GetGameState(float dt)
+	{
+		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0047: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0063: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0069: Invalid comparison between Unknown and I4
+		//IL_0373: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0379: Invalid comparison between Unknown and I4
+		//IL_0403: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0408: Unknown result type (might be due to invalid IL or missing references)
+		//IL_040a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_040e: Expected I4, but got Unknown
+		//IL_033a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_034d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02be: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02c5: Expected I4, but got Unknown
+		//IL_098d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0992: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0627: Unknown result type (might be due to invalid IL or missing references)
+		//IL_062e: Invalid comparison between Unknown and I4
+		//IL_0640: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0645: Unknown result type (might be due to invalid IL or missing references)
+		try
+		{
+			Player i = Player.i;
+			if ((Object)(object)i == (Object)null)
+			{
+				return null;
+			}
+			PlayerHealth componentInChildren = ((Component)i).GetComponentInChildren<PlayerHealth>(true);
+			if ((Object)(object)componentInChildren == (Object)null)
+			{
+				return null;
+			}
+			float x = ((Component)i).transform.position.x;
+			float y = ((Component)i).transform.position.y;
+			float velX = ((PhysicsMover)i).VelX;
+			float velY = ((PhysicsMover)i).VelY;
+			float num = (((int)((Actor)i).Facing == 1) ? 1f : (-1f));
+			bool flag = false;
+			try
+			{
+				flag = ((Actor)i).IsOnGround;
+			}
+			catch
+			{
+			}
+			float currentHealthValue = componentInChildren.CurrentHealthValue;
+			float num2 = 0f;
+			try
+			{
+				num2 = ((Health)componentInChildren).percentage;
+			}
+			catch
+			{
+			}
+			float num3 = 0f;
+			try
+			{
+				num3 = componentInChildren.CurrentInternalInjury;
+			}
+			catch
+			{
+			}
+			float num4 = 0f;
+			float num5 = 1f;
+			float num6 = 0f;
+			try
+			{
+				PlayerEnergy ammo = i.ammo;
+				if ((Object)(object)ammo != (Object)null)
+				{
+					num4 = ammo.Value;
+					num5 = ammo.MaxValue;
+					num6 = ammo.percentage;
+				}
+			}
+			catch
+			{
+			}
+			float num7 = 0f;
+			float num8 = 1f;
+			float num9 = 0f;
+			try
+			{
+				PlayerEnergy chiContainer = i.chiContainer;
+				if ((Object)(object)chiContainer != (Object)null)
+				{
+					num7 = chiContainer.Value;
+					num8 = chiContainer.MaxValue;
+					num9 = chiContainer.percentage;
+				}
+			}
+			catch
+			{
+			}
+			int num10 = 0;
+			int num11 = 1;
+			float num12 = 0f;
+			try
+			{
+				PotionContainer potion = i.potion;
+				if ((Object)(object)potion != (Object)null)
+				{
+					num10 = potion.DrinkTimesLeft;
+					num11 = potion.maxValue;
+					if (num11 > 0)
+					{
+						num12 = (float)num10 / (float)num11;
+					}
+				}
+			}
+			catch
+			{
+			}
+			float num13 = 0f;
+			float num14 = 0f;
+			float num15 = 0f;
+			float num16 = 0f;
+			float num17 = 0f;
+			float num18 = 0f;
+			float num19 = 0f;
+			float num20 = 0f;
+			int num21 = 0;
+			int num22 = 0;
+			int value = 1;
+			int value2 = 1;
+			int num23 = -1;
+			bool flag2 = false;
+			bool flag3 = false;
+			bool flag4 = false;
+			float num24 = 0f;
+			int num25 = 0;
+			float num26 = 0f;
+			float num27 = 0f;
+			int num28 = 0;
+			int num29 = 0;
+			float num30 = 0f;
+			float num31 = 0f;
+			int num32 = 0;
+			int num33 = 0;
+			MonsterBase val = null;
+			string text = "none";
+			try
+			{
+				UIMonsterHPManager val2 = (((Object)(object)SingletonBehaviour<GameCore>.Instance != (Object)null) ? SingletonBehaviour<GameCore>.Instance.monsterHpUI : null);
+				UIBossHP val3 = (((Object)(object)val2 != (Object)null) ? val2.CurrentBossHP : null);
+				if ((Object)(object)val3 != (Object)null && (Object)(object)val3.bindingPosture != (Object)null)
+				{
+					val = val3.bindingPosture.BindMonster;
+					if ((Object)(object)val != (Object)null)
+					{
+						text = "ui";
+					}
+				}
+			}
+			catch
+			{
+			}
+			if ((Object)(object)val == (Object)null)
+			{
+				int num34 = int.MinValue;
+				MonsterBase[] array = Object.FindObjectsOfType<MonsterBase>();
+				foreach (MonsterBase val4 in array)
+				{
+					if (!((Object)(object)val4 == (Object)null))
+					{
+						int num35 = 0;
+						try
+						{
+							num35 = (int)val4.monsterStat.monsterLevel;
+						}
+						catch
+						{
+						}
+						if (num35 > num34)
+						{
+							num34 = num35;
+							val = val4;
+						}
+					}
+				}
+				if ((Object)(object)val != (Object)null)
+				{
+					text = "scan";
+				}
+			}
+			_lastBossInfo = (((Object)(object)val != (Object)null) ? (((Object)val).name + "(" + text + ")") : "none");
+			if ((Object)(object)val != (Object)null)
+			{
+				num13 = ((Component)val).transform.position.x;
+				num14 = ((Component)val).transform.position.y;
+				try
+				{
+					num15 = ((PhysicsMover)val).VelX;
+					num16 = ((PhysicsMover)val).VelY;
+				}
+				catch
+				{
+				}
+				try
+				{
+					num17 = (((int)((Actor)val).Facing == 1) ? 1f : (-1f));
+				}
+				catch
+				{
+				}
+				try
+				{
+					PostureSystem postureSystem = val.postureSystem;
+					float maxPostureValue = postureSystem.MaxPostureValue;
+					num20 = maxPostureValue;
+					float num36 = _bossHpScale * maxPostureValue;
+					if (_bossHpScale < 1f && postureSystem.PostureValue > num36)
+					{
+						postureSystem.SetPostureValue((int)num36);
+					}
+					float remainTotal = postureSystem.RemainTotal;
+					num18 = remainTotal;
+					num19 = ((num36 > 0f) ? Mathf.Clamp01(remainTotal / num36) : 0f);
+				}
+				catch
+				{
+				}
+				try
+				{
+					States currentState = val.CurrentState;
+					num21 = (int)currentState;
+					string text2 = ((object)(States)(ref currentState)).ToString();
+					string name = ((Object)val).name;
+					if (_bossFsmCategories.TryGetValue(name, out var value3) && value3.TryGetValue(text2, out var value4))
+					{
+						num22 = value4;
+					}
+					if (!_bossTotalPhases.TryGetValue(name, out value) || value <= 0)
+					{
+						value = 1;
+						if (_warnedMissingTotalPhaseBoss.Add(name))
+						{
+							((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing total_phases mapping for boss=" + name + ", fallback total_phases=1"));
+						}
+					}
+					if (_bossAttackIds.TryGetValue(name, out var value5) && value5.TryGetValue(text2, out var value6))
+					{
+						num23 = value6;
+					}
+					if (_bossStatePhaseIndex.TryGetValue(name, out var value7))
+					{
+						if (!value7.TryGetValue(text2, out value2))
+						{
+							value2 = 1;
+							string item = name + "::" + text2;
+							if (_warnedMissingPhaseState.Add(item))
+							{
+								((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing phase state mapping boss=" + name + " state=" + text2 + ", fallback phase_index=1"));
+							}
+						}
+					}
+					else
+					{
+						value2 = 1;
+						if (_warnedMissingPhaseMapBoss.Add(name))
+						{
+							((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing phase map for boss=" + name + ", fallback phase_index=1"));
+						}
+					}
+					if (value2 < 1)
+					{
+						value2 = 1;
+					}
+					if (value2 > value)
+					{
+						value2 = value;
+					}
+					bool hasShieldObj = false;
+					bool shieldActive = false;
+					float shieldCur = 0f;
+					float shieldMax = 0f;
+					bool flag5 = TryReadShieldInfo(val, out hasShieldObj, out shieldActive, out shieldCur, out shieldMax);
+					flag4 = hasShieldObj && shieldActive;
+					num24 = ((hasShieldObj && shieldMax > 0f) ? Mathf.Clamp01(shieldCur / shieldMax) : 0f);
+					bool flag6 = false;
+					int num37 = 0;
+					int num38 = 0;
+					List<string> list = new List<string>();
+					num26 = 0f;
+					num27 = 0f;
+					num28 = 0;
+					num29 = 0;
+					num30 = 0f;
+					num31 = 0f;
+					num32 = 0;
+					num33 = 0;
+					float num39 = float.MaxValue;
+					float num40 = float.MaxValue;
+					try
+					{
+						DamageDealer[] array2 = Object.FindObjectsOfType<DamageDealer>();
+						foreach (DamageDealer val5 in array2)
+						{
+							if ((Object)(object)val5 == (Object)null || !((Behaviour)val5).isActiveAndEnabled || (int)val5.type != 16)
+							{
+								continue;
+							}
+							num37++;
+							Vector3 position = ((Component)val5).transform.position;
+							float num41 = position.x - x;
+							float num42 = position.y - y;
+							float num43 = num41 * num41 + num42 * num42;
+							if (!val5.parriable)
+							{
+								num38++;
+								string name2 = ((Object)((Component)val5).gameObject).name;
+								list.Add(name2);
+								flag6 = true;
+								if (name2.IndexOf("Explos", StringComparison.OrdinalIgnoreCase) >= 0)
+								{
+									num28 = 1;
+								}
+								else if (name2.IndexOf("DamageArea", StringComparison.OrdinalIgnoreCase) >= 0)
+								{
+									num29 = 1;
+								}
+								else if (name2.IndexOf("Danger", StringComparison.OrdinalIgnoreCase) >= 0)
+								{
+									num33 = 1;
+								}
+								if (num43 < num39)
+								{
+									num39 = num43;
+									num26 = num41;
+									num27 = num42;
+								}
+							}
+							else if (num43 < num40)
+							{
+								num40 = num43;
+								num30 = num41;
+								num31 = num42;
+							}
+						}
+					}
+					catch
+					{
+					}
+					num32 = num38;
+					num25 = ((num38 > 0) ? 1 : 0);
+					if (flag6)
+					{
+						num22 = 2;
+					}
+					string text3 = $"{name}|fsm={text2}({num21})|cat={num22}|aid={num23}|" + $"shield=ok={flag5},has={hasShieldObj},act={shieldActive}," + $"hp={(shieldActive ? Mathf.Round(shieldCur) : 0f):F0}/{(shieldActive ? Mathf.Round(shieldMax) : 0f):F0}";
+					if (text3 != _lastLoggedBossSig)
+					{
+						int num44 = 0;
+						int num45 = 0;
+						try
+						{
+							DamageDealer[] componentsInChildren = ((Component)val).GetComponentsInChildren<DamageDealer>(true);
+							num44 = componentsInChildren.Length;
+							DamageDealer[] array2 = componentsInChildren;
+							foreach (DamageDealer val6 in array2)
+							{
+								if ((Object)(object)val6 != (Object)null && ((Behaviour)val6).isActiveAndEnabled)
+								{
+									num45++;
+								}
+							}
+						}
+						catch
+						{
+						}
+						((BaseUnityPlugin)this).Logger.LogInfo((object)($"[boss] name={name} fsm={text2}(int={num21}) cat={num22} aid={num23} phase={value2}/{value} " + $"| shield=act={shieldActive} hp={shieldCur:F0}/{shieldMax:F0} (ok={flag5},has={hasShieldObj}) " + $"| DD bossAll={num44} bossAct={num45} sceneMonAct={num37} sceneMonUnp={num38} " + "unp=[" + string.Join(",", list) + "]"));
+						_lastLoggedBossSig = text3;
+					}
+				}
+				catch
+				{
+				}
+				try
+				{
+					flag3 = val.IsDead();
+				}
+				catch
+				{
+				}
+				flag2 = true;
+			}
+			float num46 = (flag2 ? (num13 - x) : 0f);
+			float num47 = (flag2 ? (num14 - y) : 0f);
+			bool flag7 = currentHealthValue <= 0f || flag3;
+			bool flag8 = IsPlayerControllable(i) && Time.time - _lastResetTime > 3f;
+			bool flag9 = IsHurtOrDown(i);
+			PlayerStateType currentStateType = i.CurrentStateType;
+			string text4 = ((object)(PlayerStateType)(ref currentStateType)).ToString();
+			if (_debugTick % 600 == 0)
+			{
+				string arg = (((Object)(object)val != (Object)null) ? ((Object)val).name : "(none)");
+				((BaseUnityPlugin)this).Logger.LogInfo((object)($"[state] tick={_debugTick}\n" + $"  player    : hp={currentHealthValue:F0}({num2 * 100f:F1}%) injury={num3:F0} grounded={flag} facing={num:F0}\n" + $"  resources : ammo(蒼砂/射箭)={num4:F0}/{num5:F0}({num6 * 100f:F0}%) " + $"chi(氣)={num7:F0}/{num8:F0}({num9 * 100f:F0}%) " + $"potion(藥水)={num10}/{num11}({num12 * 100f:F0}%)\n" + $"  boss      : present={flag2} name={arg} " + $"hp={num18:F0}/{num20:F0}({num19 * 100f:F1}%) cat={num22} aid={num23} phase={value2}/{value} " + $"shield=act={flag4} hp%={num24:F2}\n" + $"  scene     : hazard_unparryable={num25} count={num32} " + $"type=[exp={num28} dmgArea={num29} danger={num33}] " + $"haz_nearest=({num26:F0},{num27:F0}) " + $"atk_nearest=({num30:F0},{num31:F0})\n" + $"  events    : last_parry={_lastParryResult} parry_count={_parryCount} " + $"controllable={flag8} knocked_down={flag9} boss_dead={flag3} done={flag7}"));
+			}
+			return "{" + $"\"px\":{x},\"py\":{y},\"vx\":{velX},\"vy\":{velY}," + string.Format("\"facing\":{0},\"grounded\":{1},", num, flag ? "true" : "false") + $"\"php\":{currentHealthValue},\"php_pct\":{num2},\"internal_injury\":{num3}," + $"\"qi\":{num4},\"qi_max\":{num5},\"qi_pct\":{num6}," + $"\"chi\":{num7},\"chi_max\":{num8},\"chi_pct\":{num9}," + $"\"potion_left\":{num10},\"potion_max\":{num11},\"potion_pct\":{num12}," + $"\"last_parry_result\":{_lastParryResult},\"parry_count\":{_parryCount},\"parry_enter_count\":{_parryEnterCount}," + "\"boss_present\":" + (flag2 ? "true" : "false") + ",\"boss_name\":\"" + (((Object)(object)val != (Object)null) ? ((Object)val).name : "") + "\"," + $"\"bx\":{num13},\"by\":{num14},\"bvx\":{num15},\"bvy\":{num16}," + $"\"b_facing\":{num17},\"bdx\":{num46},\"bdy\":{num47}," + $"\"bhp\":{num18},\"bhp_pct\":{num19},\"bhp_max\":{num20}," + $"\"boss_fsm\":{num21}," + $"\"attack_category\":{num22}," + $"\"attack_id\":{num23}," + $"\"phase_index\":{value2}," + $"\"total_phases\":{value}," + "\"controllable\":" + (flag8 ? "true" : "false") + ",\"knocked_down\":" + (flag9 ? "true" : "false") + ",\"shield_active\":" + (flag4 ? "true" : "false") + "," + $"\"shield_hp_pct\":{num24}," + $"\"hazard_unparryable\":{num25}," + $"\"hazard_nearest_dx\":{num26},\"hazard_nearest_dy\":{num27}," + $"\"hazard_type_explosion\":{num28},\"hazard_type_damagearea\":{num29}," + $"\"attack_nearest_dx\":{num30},\"attack_nearest_dy\":{num31}," + $"\"hazard_count\":{num32},\"hazard_type_danger\":{num33}," + $"\"dt\":{dt}," + "\"state\":\"" + text4 + "\",\"boss_dead\":" + (flag3 ? "true" : "false") + ",\"done\":" + (flag7 ? "true" : "false") + "}\n";
+		}
+		catch (Exception ex)
+		{
+			((BaseUnityPlugin)this).Logger.LogError((object)ex);
+			return null;
+		}
+	}
 
-                return "{" +
-                    $"\"px\":{px},\"py\":{py},\"vx\":{vx},\"vy\":{vy}," +
-                    $"\"facing\":{facing},\"grounded\":{(grounded ? "true" : "false")}," +
-                    $"\"php\":{php},\"php_pct\":{phpPct},\"internal_injury\":{injury}," +
-                    $"\"qi\":{qi},\"qi_max\":{qiMax},\"qi_pct\":{qiPct}," +
-                    $"\"last_parry_result\":{_lastParryResult},\"parry_count\":{_parryCount}," +
-                    $"\"boss_present\":{(bossPresent ? "true" : "false")}," +
-                    $"\"boss_name\":\"{(boss != null ? boss.name : "")}\"," +
-                    $"\"bx\":{bx},\"by\":{by},\"bvx\":{bvx},\"bvy\":{bvy}," +
-                    $"\"b_facing\":{bFacing},\"bdx\":{bdx},\"bdy\":{bdy}," +
-                    $"\"bhp\":{bhp},\"bhp_pct\":{bhpPct},\"bhp_max\":{bhpMax}," +
-                    $"\"boss_fsm\":{bossFsm}," +
-                    $"\"attack_category\":{attackCategory}," +
-                    $"\"attack_id\":{attackId}," +
-                    $"\"total_phases\":{totalPhases}," +
-                    $"\"controllable\":{(controllable ? "true" : "false")}," +
-                    $"\"knocked_down\":{(knockedDown ? "true" : "false")}," +
-                    $"\"dt\":{dt}," +
-                    $"\"state\":\"{state}\"," +
-                    $"\"boss_dead\":{(bossDead ? "true" : "false")}," +
-                    $"\"done\":{(done ? "true" : "false")}" +
-                    "}\n";
-            }
-            catch (Exception e)
-            {
-                Logger.LogError(e);
-                return null;
-            }
-        }
+	private void SendState(string json)
+	{
+		if (_stream == null)
+		{
+			return;
+		}
+		try
+		{
+			byte[] bytes = Encoding.UTF8.GetBytes(json);
+			_stream.Write(bytes, 0, bytes.Length);
+		}
+		catch
+		{
+			Disconnect();
+		}
+	}
 
-        private void SendState(string json)
-        {
-            if (_stream == null) return;
-            try
-            {
-                var bytes = Encoding.UTF8.GetBytes(json);
-                _stream.Write(bytes, 0, bytes.Length);
-            }
-            catch { Disconnect(); }
-        }
+	private void ParseAction(string json)
+	{
+		try
+		{
+			int num = json.LastIndexOf('{');
+			if (num > 0)
+			{
+				json = json.Substring(num);
+			}
+			if (json.Replace(" ", "").Contains("\"reset\":true"))
+			{
+				DoHardReset();
+				return;
+			}
+			int num2 = ExtractInt(json, "move");
+			_moveDir = ((num2 == 1) ? (-1) : ((num2 == 2) ? 1 : 0));
+			switch (ExtractInt(json, "dodge"))
+			{
+			case 1:
+			{
+				bool flag = false;
+				try
+				{
+					flag = (Object)(object)Player.i != (Object)null && ((Actor)Player.i).IsOnGround;
+				}
+				catch
+				{
+				}
+				if (flag || _jumpPulse == 0)
+				{
+					_jumpPulse = 3;
+				}
+				break;
+			}
+			case 2:
+				_dashPulse = 3;
+				break;
+			}
+			switch (ExtractInt(json, "attack"))
+			{
+			case 1:
+				_meleePulse = 3;
+				break;
+			case 2:
+				_rangedPulse = 3;
+				break;
+			case 3:
+				_parryPulse = 3;
+				break;
+			case 4:
+				_talismanPulse = 3;
+				break;
+			case 5:
+				_healPulse = 3;
+				break;
+			}
+			_bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
+		}
+		catch
+		{
+		}
+	}
 
-        private void ParseAction(string json)
-        {
-            try
-            {
-                // 一個封包可能含多筆 JSON，取最後一筆
-                int last = json.LastIndexOf('{');
-                if (last > 0) json = json.Substring(last);
+	private void DoHardReset()
+	{
+		if (Time.time - _lastResetTime < 3f)
+		{
+			return;
+		}
+		_lastResetTime = Time.time;
+		_moveDir = 0;
+		_jumpPulse = (_dashPulse = (_meleePulse = (_rangedPulse = (_parryPulse = (_talismanPulse = (_healPulse = 0))))));
+		try
+		{
+			Player.i.Suicide();
+		}
+		catch (Exception ex)
+		{
+			((BaseUnityPlugin)this).Logger.LogError((object)("[reset] " + ex));
+		}
+	}
 
-                // reset 指令：要求重載 JieChuan 挑戰（確定性 episode reset）
-                if (json.Replace(" ", "").Contains("\"reset\":true"))
-                {
-                    DoHardReset();
-                    return;
-                }
+	private static int ExtractInt(string json, string key)
+	{
+		string text = "\"" + key + "\":";
+		int num = json.IndexOf(text);
+		if (num < 0)
+		{
+			return 0;
+		}
+		int i;
+		for (i = num + text.Length; i < json.Length && json[i] == ' '; i++)
+		{
+		}
+		int j;
+		for (j = i; j < json.Length && (char.IsDigit(json[j]) || json[j] == '-'); j++)
+		{
+		}
+		if (j == i)
+		{
+			return 0;
+		}
+		return int.Parse(json.Substring(i, j - i));
+	}
 
-                // move: 0 停 / 1 左 / 2 右
-                int move = ExtractInt(json, "move");
-                _moveDir = move == 1 ? -1 : move == 2 ? 1 : 0;
+	private static float ExtractFloat(string json, string key, float fallback)
+	{
+		string text = "\"" + key + "\":";
+		int num = json.IndexOf(text);
+		if (num < 0)
+		{
+			return fallback;
+		}
+		int i;
+		for (i = num + text.Length; i < json.Length && json[i] == ' '; i++)
+		{
+		}
+		int j;
+		for (j = i; j < json.Length && (char.IsDigit(json[j]) || json[j] == '-' || json[j] == '+' || json[j] == '.' || json[j] == 'e' || json[j] == 'E'); j++)
+		{
+		}
+		if (j == i)
+		{
+			return fallback;
+		}
+		if (!float.TryParse(json.Substring(i, j - i), NumberStyles.Float, CultureInfo.InvariantCulture, out var result))
+		{
+			return fallback;
+		}
+		return result;
+	}
 
-                // dodge: 0 無 / 1 跳 / 2 衝刺
-                int dodge = ExtractInt(json, "dodge");
-                if      (dodge == 1) _jumpPulse = PULSE;
-                else if (dodge == 2) _dashPulse = PULSE;
-
-                // attack: 0 無 / 1 近戰 / 2 遠程 / 3 格檔 / 4 貼符 / 5 喝藥
-                int atk = ExtractInt(json, "attack");
-                if      (atk == 1) _meleePulse    = PULSE;
-                else if (atk == 2) _rangedPulse   = PULSE;
-                else if (atk == 3) _parryPulse    = PULSE;
-                else if (atk == 4) _talismanPulse = PULSE;
-                else if (atk == 5) _healPulse     = PULSE;
-
-                // boss_hp_scale: curriculum 弱化倍率（封包沒帶就維持原值）
-                _bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
-            }
-            catch { }
-        }
-
-        // hard reset：呼叫 Player.Suicide()（= 暫停選單「重置挑戰」按鈕本體）。
-        // memory mode 下玩家死亡 → 遊戲自動重啟此場 boss 戰。截斷/敗/勝皆適用。
-        private void DoHardReset()
-        {
-            if (Time.time - _lastResetTime < 3f) return;   // 去抖：避免短時間重複觸發
-            _lastResetTime = Time.time;
-            _moveDir = 0;
-            _jumpPulse = _dashPulse = _meleePulse = _rangedPulse = _parryPulse = _talismanPulse = _healPulse = 0;
-            try
-            {
-                Player.i.Suicide();   // health=-1 + DeadCheck，硬殺、繞過無敵
-                Logger.LogInfo("[reset] Player.Suicide() → 重啟記憶戰鬥");
-            }
-            catch (Exception e) { Logger.LogError("[reset] " + e); }
-        }
-
-        private static int ExtractInt(string json, string key)
-        {
-            string search = $"\"{key}\":";
-            int idx = json.IndexOf(search);
-            if (idx < 0) return 0;
-            int start = idx + search.Length;
-            while (start < json.Length && json[start] == ' ') start++;   // 跳過空白
-            int end = start;
-            while (end < json.Length && (char.IsDigit(json[end]) || json[end] == '-'))
-                end++;
-            if (end == start) return 0;
-            return int.Parse(json.Substring(start, end - start));
-        }
-
-        // 解析浮點數（curriculum 的 boss_hp_scale 用）；key 不存在或解析失敗回傳 fallback。
-        private static float ExtractFloat(string json, string key, float fallback)
-        {
-            string search = $"\"{key}\":";
-            int idx = json.IndexOf(search);
-            if (idx < 0) return fallback;
-            int start = idx + search.Length;
-            while (start < json.Length && json[start] == ' ') start++;
-            int end = start;
-            while (end < json.Length &&
-                   (char.IsDigit(json[end]) || json[end] == '-' || json[end] == '+' ||
-                    json[end] == '.' || json[end] == 'e' || json[end] == 'E'))
-                end++;
-            if (end == start) return fallback;
-            return float.TryParse(json.Substring(start, end - start),
-                                  System.Globalization.NumberStyles.Float,
-                                  System.Globalization.CultureInfo.InvariantCulture,
-                                  out float v) ? v : fallback;
-        }
-
-        void OnDestroy()
-        {
-            Disconnect();
-        }
-    }
+	private void OnDestroy()
+	{
+		Disconnect();
+	}
 }
