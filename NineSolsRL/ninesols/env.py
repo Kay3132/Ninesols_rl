@@ -285,6 +285,7 @@ class NineSolsEnv(gym.Env):
         elif act["attack"] == 6:
             self._charge_macro_lock = 89   # 40 hold(含當前 step)+ 50 release
             act["attack"] = 1               # 當前 step 就是 hold 第 1 步
+            self._ep_charged_count += 1     # 每次 macro 觸發 +1(agent 真實意圖)
 
         # 2026-06-15 Round 22: parry attempt incentive(conditional + edge + recovery filter)
         # 條件 AND:
@@ -302,9 +303,8 @@ class NineSolsEnv(gym.Env):
                 and not in_recovery):
             parry_attempt_bonus = W_PARRY_ATTEMPT
 
-        # 2026-06-15 Round 21 v3: charged / double_jump 仍 action edge(state 端無乾淨訊號)
-        if act["attack"] == 6 and self._prev_act_attack != 6:
-            self._ep_charged_count += 1
+        # 2026-06-15 Round 23 v4: charged 計數移到 macro trigger 那行(elif 內),這裡刪掉。
+        # 否則 macro 把 act[attack] 改成 1,這裡 act["attack"]==6 永遠 False,charged 一直 0。
         # 雙跳:dodge=1 edge,且上一幀 player 不在地面(從一跳起跳開始的「第二次按跳」)
         if act["dodge"] == 1 and self._prev_act_dodge != 1 \
                 and self._prev_raw is not None \
@@ -319,8 +319,9 @@ class NineSolsEnv(gym.Env):
 
         # 2026-06-15 Round 21 v3: ranged / heal / chi 用 state delta 觀察(game-side 真實事件)
         if self._prev_raw is not None:
-            d_ammo = float(s.get("ranged_ammo", 0)) - float(self._prev_raw.get("ranged_ammo", 0))
-            if d_ammo <= -0.5:        # 蒼砂 -1 → ranged 真射出
+            # Plugin JSON 欄位是 "qi"(蒼砂),不是 "ranged_ammo"。修了 Round 22 CSV 全 0 的 bug。
+            d_qi = float(s.get("qi", 0)) - float(self._prev_raw.get("qi", 0))
+            if d_qi <= -0.5:          # 蒼砂 -1 → ranged 真射出
                 self._ep_ranged_count += 1
             d_potion = int(s.get("potion_left", 0)) - int(self._prev_raw.get("potion_left", 0))
             if d_potion <= -1:        # 藥水 -1 → 真喝了
