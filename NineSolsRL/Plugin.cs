@@ -9,10 +9,11 @@ using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
+using Object = UnityEngine.Object;
 
 namespace NineSolsRL;
 
-[BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "2.0.0")]
+[BepInPlugin("com.ninesolsrl.plugin", "NineSolsRL", "2.1.0")]
 public class Plugin : BaseUnityPlugin
 {
 	[HarmonyPatch(typeof(GameCore), "Update")]
@@ -32,10 +33,17 @@ public class Plugin : BaseUnityPlugin
 		private static void Postfix(Player __instance)
 		{
 			_hmcCalls++;
-			Plugin instance = Instance;
-			if (instance != null && instance._connected && __instance != null && IsPlayerControllable(__instance))
+			// 2026-06-15 Round 21 fix: 跟 WasPressed/IsPressed 同問題 ——
+			// `Plugin instance = Instance` 在 postfix 上下文被 Unity 判 destroyed(null),
+			// 即使 Awake 已設好。改用 s_moveDir 靜態鏡像,完全繞過 Instance。
+			// 2026-06-15 Round 21 fix v2: ctrl+c 後 s_connected=false → 不干預鍵盤輸入。
+			if (!s_connected)
 			{
-				int moveDir = instance._moveDir;
+				return;
+			}
+			if (__instance != null && IsPlayerControllable(__instance))
+			{
+				int moveDir = s_moveDir;
 				float num;
 				try
 				{
@@ -64,15 +72,13 @@ public class Plugin : BaseUnityPlugin
 		private static void Postfix(ParryResultData data)
 		{
 			//IL_000c: Unknown result type (might be due to invalid IL or missing references)
-			Plugin instance = Instance;
-			if (instance == null)
-			{
-				return;
-			}
+			// 2026-06-15 Round 21 fix: 跟 HorizontalMoveCheck 同 bug ——
+			// `Plugin instance = Instance` 在 postfix 上下文被 Unity 判 destroyed → 從沒 ++。
+			// 改寫靜態欄位完全繞過 Instance。
 			try
 			{
-				instance._lastParryResult = ((!data.isAccurate) ? 1 : 2);
-				instance._parryCount++;
+				s_lastParryResult = ((!data.isAccurate) ? 1 : 2);
+				s_parryCount++;
 			}
 			catch
 			{
@@ -85,14 +91,10 @@ public class Plugin : BaseUnityPlugin
 	{
 		private static void Postfix()
 		{
-			Plugin instance = Instance;
-			if (instance == null)
-			{
-				return;
-			}
+			// 2026-06-15 Round 21 fix: 同 PatchEffectParried 改靜態欄位
 			try
 			{
-				instance._parryEnterCount++;
+				s_parryEnterCount++;
 			}
 			catch
 			{
@@ -128,7 +130,7 @@ public class Plugin : BaseUnityPlugin
 
 	private int _healPulse;
 
-	private const int PULSE = 3;
+	private const int PULSE = 10;
 
 	private float _bossHpScale = 1f;
 
@@ -136,11 +138,13 @@ public class Plugin : BaseUnityPlugin
 
 	private string _lastBossInfo = "none";
 
-	private int _lastParryResult;
+	// 2026-06-15 Round 21 fix: 改 static,讓 PatchParryEnter / PatchEffectParried postfix
+	// 不用透過 Plugin.Instance 寫(Instance 在 postfix 上下文被 Unity 判 null → 從沒 ++)。
+	private static int s_lastParryResult;
 
-	private int _parryCount;
+	private static int s_parryCount;
 
-	public int _parryEnterCount;
+	private static int s_parryEnterCount;
 
 	private const bool LOG_BOSS = true;
 
@@ -238,6 +242,49 @@ public class Plugin : BaseUnityPlugin
 
 	public static long _hmcCalls = 0L;
 
+	// 2026-06-14 fix: Plugin.Instance 在 WasPressed/IsPressed postfix 上下文被 Unity 視為 destroyed (=null),
+	// 即使 OnGameUpdate 正常跑。改用 static 鏡像欄位,postfix 完全不依賴 Instance。
+	// 2026-06-15 Round 21 fix: HorizontalMoveCheck postfix 上下文 Plugin.Instance 被 Unity 判 null,
+	// 改用 s_moveDir 靜態鏡像
+	private static int s_moveDir;
+
+	// 2026-06-15 Round 21 fix v2: ctrl+c 後若 Postfix 仍跑(s_moveDir=0 強制覆寫 moveX=0)
+	// 會吃掉玩家鍵盤輸入。s_connected=false 時 Postfix 整段跳過,讓 game 自然處理。
+	private static bool s_connected;
+
+	// 2026-06-15 Round 21: 蓄力擊 lock —— attack=6 觸發後 70 game frame 內,
+	// 整個 attack switch 被跳過。雙重保護:case 1 Math.Max 防止覆寫,lock 防止
+	// 其他 attack(parry/ranged/heal)中斷 charge。
+	private int _chargeLockFrames;
+	private static int s_jumpPulse;
+	private static int s_dashPulse;
+	private static int s_meleePulse;
+	private static int s_rangedPulse;
+	private static int s_parryPulse;
+	private static int s_talismanPulse;
+	private static int s_healPulse;
+	private static PlayerGamePlayActionSet s_actions;
+
+	// 2026-06-15 Round 20: edge detection
+	// WasPressed 只在「從非按到按」的瞬間 true(1 game frame),IsPressed 持續按住期間 true。
+	// 這樣 game 不會誤認 hold pattern 為連續多次按下(雙跳第一跳同時用掉兩個 jump 用量的 bug)。
+	private int _prevDodge;
+	private int _prevAttack;
+	private int _jumpEdge;     // 1 game frame 後衰減
+	private int _dashEdge;
+	private int _meleeEdge;
+	private int _rangedEdge;
+	private int _parryEdge;
+	private int _talismanEdge;
+	private int _healEdge;
+	private static int s_jumpEdge;
+	private static int s_dashEdge;
+	private static int s_meleeEdge;
+	private static int s_rangedEdge;
+	private static int s_parryEdge;
+	private static int s_talismanEdge;
+	private static int s_healEdge;
+
 	private PlayerGamePlayActionSet _cachedActions;
 
 	private static bool TryReadShieldInfo(MonsterBase boss, out bool hasShieldObj, out bool shieldActive, out float shieldCur, out float shieldMax)
@@ -276,8 +323,9 @@ public class Plugin : BaseUnityPlugin
 		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0073: Expected O, but got Unknown
 		Instance = this;
-		Log = ((BaseUnityPlugin)this).Logger;
-		Object.DontDestroyOnLoad((Object)(object)((Component)this).gameObject);
+		Log = Logger;
+		Logger.LogInfo((object)"[NineSolsRL] Awake v2.1.0 啟動");
+		UnityEngine.Object.DontDestroyOnLoad((Object)(object)((Component)this).gameObject);
 		Harmony val = new Harmony("com.ninesolsrl.plugin");
 		val.PatchAll();
 		try
@@ -287,15 +335,22 @@ public class Plugin : BaseUnityPlugin
 			{
 				MethodInfo methodInfo = AccessTools.PropertyGetter(type, "WasPressed");
 				val.Patch((MethodBase)methodInfo, (HarmonyMethod)null, new HarmonyMethod(typeof(Plugin).GetMethod("WasPressedPostfix", BindingFlags.Static | BindingFlags.NonPublic)), (HarmonyMethod)null, (HarmonyMethod)null, (HarmonyMethod)null);
+				Logger.LogInfo((object)"[NineSolsRL] InControl.OneAxisInputControl.WasPressed patched");
+				MethodInfo isPressedGetter = AccessTools.PropertyGetter(type, "IsPressed");
+				if (isPressedGetter != null)
+				{
+					val.Patch((MethodBase)isPressedGetter, (HarmonyMethod)null, new HarmonyMethod(typeof(Plugin).GetMethod("IsPressedPostfix", BindingFlags.Static | BindingFlags.NonPublic)), (HarmonyMethod)null, (HarmonyMethod)null, (HarmonyMethod)null);
+					Logger.LogInfo((object)"[NineSolsRL] InControl.OneAxisInputControl.IsPressed patched");
+				}
 			}
 			else
 			{
-				((BaseUnityPlugin)this).Logger.LogError((object)"找不到 InControl.OneAxisInputControl 型別，離散動作將無法注入");
+				Logger.LogError((object)"[NineSolsRL] 找不到 InControl.OneAxisInputControl 型別，離散動作將無法注入");
 			}
 		}
 		catch (Exception ex)
 		{
-			((BaseUnityPlugin)this).Logger.LogError((object)("InControl patch 失敗: " + ex));
+			Logger.LogError((object)("[NineSolsRL] InControl patch 失敗: " + ex));
 		}
 	}
 
@@ -365,49 +420,76 @@ public class Plugin : BaseUnityPlugin
 
 	private static void WasPressedPostfix(object __instance, ref bool __result)
 	{
-		Plugin instance = Instance;
-		if (instance == null || !instance._connected)
-		{
-			return;
-		}
-		PlayerGamePlayActionSet actions = instance.GetActions();
+		// 完全用 static 欄位,繞過 Plugin.Instance(在 postfix 上下文被 Unity 視為 destroyed)
+		PlayerGamePlayActionSet actions = s_actions;
 		if (actions == null)
 		{
 			return;
 		}
-		Player i = Player.i;
-		if (IsPlayerControllable(i))
+		Player p = Player.i;
+		bool controllable = IsPlayerControllable(p);
+		bool hurtOrDown = !controllable && IsHurtOrDown(p);
+		// WasPressed 用 edge,只在「從非按到按」那 1 frame true。修連續 hold 被 game 誤認連按 N 次的 bug。
+		if (controllable)
 		{
-			if (instance._jumpPulse > 0 && __instance == actions.Jump)
+			if (s_jumpEdge > 0 && __instance == actions.Jump)
 			{
 				__result = true;
 			}
-			else if (instance._dashPulse > 0 && __instance == actions.Dodge)
+			else if (s_dashEdge > 0 && __instance == actions.Dodge)
 			{
 				__result = true;
 			}
-			else if (instance._meleePulse > 0 && __instance == actions.Attack)
+			else if (s_meleeEdge > 0 && __instance == actions.Attack)
 			{
 				__result = true;
 			}
-			else if (instance._rangedPulse > 0 && __instance == actions.WeaponAttack)
+			else if (s_rangedEdge > 0 && __instance == actions.WeaponAttack)
 			{
 				__result = true;
 			}
-			else if (instance._parryPulse > 0 && __instance == actions.Parry)
+			else if (s_parryEdge > 0 && __instance == actions.Parry)
 			{
 				__result = true;
 			}
-			else if (instance._talismanPulse > 0 && __instance == actions.FooAttack)
+			else if (s_talismanEdge > 0 && __instance == actions.FooAttack)
 			{
 				__result = true;
 			}
-			else if (instance._healPulse > 0 && __instance == actions.Heal)
+			else if (s_healEdge > 0 && __instance == actions.Heal)
 			{
 				__result = true;
 			}
 		}
-		else if (IsHurtOrDown(i) && instance._dashPulse > 0 && __instance == actions.Dodge)
+		else if (hurtOrDown && s_dashEdge > 0 && __instance == actions.Dodge)
+		{
+			__result = true;
+		}
+	}
+
+	// 2026-06-14: IsPressed patch（保守版,只 Jump + Attack）
+	// Jump:解 in-air 雙跳(遊戲端 in-air jump 邏輯查 IsPressed 確認真的按住)
+	// Attack:agent 連送 attack=1 時 IsPressed 持續 true → 觸發蓄力擊(破盾)
+	// 其他動作維持只 patch WasPressed,避免遠程/貼符/喝藥意外變成「持續按住」
+	private static void IsPressedPostfix(object __instance, ref bool __result)
+	{
+		PlayerGamePlayActionSet actions = s_actions;
+		if (actions == null)
+		{
+			return;
+		}
+		// 2026-06-15 Round 23 fix: 拿掉 IsPlayerControllable check —— 玩家在 Attack/Jump
+		// state 時 CurrentStateType != 0,IsPlayerControllable 回 false → postfix 提早 return
+		// → game 以為輕擊瞬間就鬆手 → light attack 結束後**無法**進入 Charging state。
+		// 真實鍵盤玩 game 時 IsPressed 是 input layer,跟 player state 無關。
+		// s_xxxPulse 自身是 macro 控制(case 6 才設 _meleePulse=120),沒 macro 時 = 0,
+		// 不會誤在 cutscene/death 期間發 fake input,安全。
+		// IsPressed 給 Jump(維持 variable jump height)+ Attack(蓄力擊破盾)
+		if (s_jumpPulse > 0 && __instance == actions.Jump)
+		{
+			__result = true;
+		}
+		else if (s_meleePulse > 0 && __instance == actions.Attack)
 		{
 			__result = true;
 		}
@@ -432,6 +514,7 @@ public class Plugin : BaseUnityPlugin
 				return null;
 			}
 			_cachedActions = playerInput.gameplayActions;
+			s_actions = _cachedActions;
 		}
 		catch
 		{
@@ -442,33 +525,72 @@ public class Plugin : BaseUnityPlugin
 	public void OnGameUpdate()
 	{
 		_debugTick++;
+		// 2026-06-14 fix: 主動 prime s_actions 給 postfix 用(postfix 上下文無法 call instance method)
+		if (s_actions == null)
+		{
+			GetActions();
+		}
 		if (_jumpPulse > 0)
 		{
 			_jumpPulse--;
 		}
+		s_jumpPulse = _jumpPulse;
 		if (_dashPulse > 0)
 		{
 			_dashPulse--;
 		}
+		s_dashPulse = _dashPulse;
 		if (_meleePulse > 0)
 		{
 			_meleePulse--;
 		}
+		s_meleePulse = _meleePulse;
 		if (_rangedPulse > 0)
 		{
 			_rangedPulse--;
 		}
+		s_rangedPulse = _rangedPulse;
 		if (_parryPulse > 0)
 		{
 			_parryPulse--;
 		}
+		s_parryPulse = _parryPulse;
 		if (_talismanPulse > 0)
 		{
 			_talismanPulse--;
 		}
+		s_talismanPulse = _talismanPulse;
 		if (_healPulse > 0)
 		{
 			_healPulse--;
+		}
+		s_healPulse = _healPulse;
+		// 2026-06-15 Round 21: 蓄力擊 lock 倒數
+		if (_chargeLockFrames > 0) { _chargeLockFrames--; }
+		// 2026-06-15 Round 20: edge fields 衰減(只活 1 game frame)
+		if (_jumpEdge > 0) { _jumpEdge--; }
+		s_jumpEdge = _jumpEdge;
+		if (_dashEdge > 0) { _dashEdge--; }
+		s_dashEdge = _dashEdge;
+		if (_meleeEdge > 0) { _meleeEdge--; }
+		s_meleeEdge = _meleeEdge;
+		if (_rangedEdge > 0) { _rangedEdge--; }
+		s_rangedEdge = _rangedEdge;
+		if (_parryEdge > 0) { _parryEdge--; }
+		s_parryEdge = _parryEdge;
+		if (_talismanEdge > 0) { _talismanEdge--; }
+		s_talismanEdge = _talismanEdge;
+		if (_healEdge > 0) { _healEdge--; }
+		s_healEdge = _healEdge;
+		// 2026-06-15 Round 23: 蓄力 lock 期間每 game frame refresh _meleePulse=PULSE,
+		// 模仿 test_charged_attack 的「每 step 重設 pulse=10」pattern,
+		// 因為 game 端不認一次性大 pulse + 自然衰減的 IsPressed=true 軌跡。
+		// lock 衰到 0 後不再 refresh,_meleePulse 自然從 PULSE 衰減 → 0,
+		// game 看到 IsPressed 轉 false → 觸發釋放動畫。
+		if (_chargeLockFrames > 0)
+		{
+			_meleePulse = PULSE;
+			s_meleePulse = PULSE;
 		}
 		if (!_connected)
 		{
@@ -524,6 +646,7 @@ public class Plugin : BaseUnityPlugin
 			{
 				_stream = _pendingClient.GetStream();
 				_connected = true;
+				s_connected = true;   // 2026-06-15 Round 21 fix: sync static mirror for postfix
 			}
 			else
 			{
@@ -556,6 +679,16 @@ public class Plugin : BaseUnityPlugin
 	{
 		_moveDir = 0;
 		_jumpPulse = (_dashPulse = (_meleePulse = (_rangedPulse = (_parryPulse = (_talismanPulse = (_healPulse = 0))))));
+		// 2026-06-15 Round 21 fix: ctrl+c 斷線後若沒同步靜態鏡像,HorizontalMoveCheck.Postfix
+		// 仍會用最後一次的 s_moveDir → 角色自己走。InControl postfix 同理會繼續送 fake input。
+		s_moveDir = 0;
+		s_jumpPulse = s_dashPulse = s_meleePulse = s_rangedPulse =
+			s_parryPulse = s_talismanPulse = s_healPulse = 0;
+		s_jumpEdge = s_dashEdge = s_meleeEdge = s_rangedEdge =
+			s_parryEdge = s_talismanEdge = s_healEdge = 0;
+		_chargeLockFrames = 0;
+		_prevDodge = 0;
+		_prevAttack = 0;
 		try
 		{
 			_stream?.Close();
@@ -574,6 +707,7 @@ public class Plugin : BaseUnityPlugin
 		_pendingClient = null;
 		_connectTask = null;
 		_connected = false;
+		s_connected = false;   // 2026-06-15 Round 21 fix v2: 讓 Postfix 完全不干預鍵盤
 	}
 
 	private string GetGameState(float dt)
@@ -802,9 +936,9 @@ public class Plugin : BaseUnityPlugin
 				}
 				try
 				{
-					States currentState = val.CurrentState;
+					var currentState = val.CurrentState;
 					num21 = (int)currentState;
-					string text2 = ((object)(States)(ref currentState)).ToString();
+					string text2 = currentState.ToString();
 					string name = ((Object)val).name;
 					if (_bossFsmCategories.TryGetValue(name, out var value3) && value3.TryGetValue(text2, out var value4))
 					{
@@ -815,7 +949,7 @@ public class Plugin : BaseUnityPlugin
 						value = 1;
 						if (_warnedMissingTotalPhaseBoss.Add(name))
 						{
-							((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing total_phases mapping for boss=" + name + ", fallback total_phases=1"));
+							Logger.LogWarning((object)("[phase] missing total_phases mapping for boss=" + name + ", fallback total_phases=1"));
 						}
 					}
 					if (_bossAttackIds.TryGetValue(name, out var value5) && value5.TryGetValue(text2, out var value6))
@@ -830,7 +964,7 @@ public class Plugin : BaseUnityPlugin
 							string item = name + "::" + text2;
 							if (_warnedMissingPhaseState.Add(item))
 							{
-								((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing phase state mapping boss=" + name + " state=" + text2 + ", fallback phase_index=1"));
+								Logger.LogWarning((object)("[phase] missing phase state mapping boss=" + name + " state=" + text2 + ", fallback phase_index=1"));
 							}
 						}
 					}
@@ -839,7 +973,7 @@ public class Plugin : BaseUnityPlugin
 						value2 = 1;
 						if (_warnedMissingPhaseMapBoss.Add(name))
 						{
-							((BaseUnityPlugin)this).Logger.LogWarning((object)("[phase] missing phase map for boss=" + name + ", fallback phase_index=1"));
+							Logger.LogWarning((object)("[phase] missing phase map for boss=" + name + ", fallback phase_index=1"));
 						}
 					}
 					if (value2 < 1)
@@ -948,7 +1082,7 @@ public class Plugin : BaseUnityPlugin
 						catch
 						{
 						}
-						((BaseUnityPlugin)this).Logger.LogInfo((object)($"[boss] name={name} fsm={text2}(int={num21}) cat={num22} aid={num23} phase={value2}/{value} " + $"| shield=act={shieldActive} hp={shieldCur:F0}/{shieldMax:F0} (ok={flag5},has={hasShieldObj}) " + $"| DD bossAll={num44} bossAct={num45} sceneMonAct={num37} sceneMonUnp={num38} " + "unp=[" + string.Join(",", list) + "]"));
+						Logger.LogInfo((object)($"[boss] name={name} fsm={text2}(int={num21}) cat={num22} aid={num23} phase={value2}/{value} " + $"| shield=act={shieldActive} hp={shieldCur:F0}/{shieldMax:F0} (ok={flag5},has={hasShieldObj}) " + $"| DD bossAll={num44} bossAct={num45} sceneMonAct={num37} sceneMonUnp={num38} " + "unp=[" + string.Join(",", list) + "]"));
 						_lastLoggedBossSig = text3;
 					}
 				}
@@ -970,17 +1104,17 @@ public class Plugin : BaseUnityPlugin
 			bool flag8 = IsPlayerControllable(i) && Time.time - _lastResetTime > 3f;
 			bool flag9 = IsHurtOrDown(i);
 			PlayerStateType currentStateType = i.CurrentStateType;
-			string text4 = ((object)(PlayerStateType)(ref currentStateType)).ToString();
+			string text4 = currentStateType.ToString();
 			if (_debugTick % 600 == 0)
 			{
 				string arg = (((Object)(object)val != (Object)null) ? ((Object)val).name : "(none)");
-				((BaseUnityPlugin)this).Logger.LogInfo((object)($"[state] tick={_debugTick}\n" + $"  player    : hp={currentHealthValue:F0}({num2 * 100f:F1}%) injury={num3:F0} grounded={flag} facing={num:F0}\n" + $"  resources : ammo(蒼砂/射箭)={num4:F0}/{num5:F0}({num6 * 100f:F0}%) " + $"chi(氣)={num7:F0}/{num8:F0}({num9 * 100f:F0}%) " + $"potion(藥水)={num10}/{num11}({num12 * 100f:F0}%)\n" + $"  boss      : present={flag2} name={arg} " + $"hp={num18:F0}/{num20:F0}({num19 * 100f:F1}%) cat={num22} aid={num23} phase={value2}/{value} " + $"shield=act={flag4} hp%={num24:F2}\n" + $"  scene     : hazard_unparryable={num25} count={num32} " + $"type=[exp={num28} dmgArea={num29} danger={num33}] " + $"haz_nearest=({num26:F0},{num27:F0}) " + $"atk_nearest=({num30:F0},{num31:F0})\n" + $"  events    : last_parry={_lastParryResult} parry_count={_parryCount} " + $"controllable={flag8} knocked_down={flag9} boss_dead={flag3} done={flag7}"));
+				Logger.LogInfo((object)($"[state] tick={_debugTick}\n" + $"  player    : hp={currentHealthValue:F0}({num2 * 100f:F1}%) injury={num3:F0} grounded={flag} facing={num:F0}\n" + $"  resources : ammo(蒼砂/射箭)={num4:F0}/{num5:F0}({num6 * 100f:F0}%) " + $"chi(氣)={num7:F0}/{num8:F0}({num9 * 100f:F0}%) " + $"potion(藥水)={num10}/{num11}({num12 * 100f:F0}%)\n" + $"  boss      : present={flag2} name={arg} " + $"hp={num18:F0}/{num20:F0}({num19 * 100f:F1}%) cat={num22} aid={num23} phase={value2}/{value} " + $"shield=act={flag4} hp%={num24:F2}\n" + $"  scene     : hazard_unparryable={num25} count={num32} " + $"type=[exp={num28} dmgArea={num29} danger={num33}] " + $"haz_nearest=({num26:F0},{num27:F0}) " + $"atk_nearest=({num30:F0},{num31:F0})\n" + $"  events    : last_parry={s_lastParryResult} parry_count={s_parryCount} " + $"controllable={flag8} knocked_down={flag9} boss_dead={flag3} done={flag7}"));
 			}
-			return "{" + $"\"px\":{x},\"py\":{y},\"vx\":{velX},\"vy\":{velY}," + string.Format("\"facing\":{0},\"grounded\":{1},", num, flag ? "true" : "false") + $"\"php\":{currentHealthValue},\"php_pct\":{num2},\"internal_injury\":{num3}," + $"\"qi\":{num4},\"qi_max\":{num5},\"qi_pct\":{num6}," + $"\"chi\":{num7},\"chi_max\":{num8},\"chi_pct\":{num9}," + $"\"potion_left\":{num10},\"potion_max\":{num11},\"potion_pct\":{num12}," + $"\"last_parry_result\":{_lastParryResult},\"parry_count\":{_parryCount},\"parry_enter_count\":{_parryEnterCount}," + "\"boss_present\":" + (flag2 ? "true" : "false") + ",\"boss_name\":\"" + (((Object)(object)val != (Object)null) ? ((Object)val).name : "") + "\"," + $"\"bx\":{num13},\"by\":{num14},\"bvx\":{num15},\"bvy\":{num16}," + $"\"b_facing\":{num17},\"bdx\":{num46},\"bdy\":{num47}," + $"\"bhp\":{num18},\"bhp_pct\":{num19},\"bhp_max\":{num20}," + $"\"boss_fsm\":{num21}," + $"\"attack_category\":{num22}," + $"\"attack_id\":{num23}," + $"\"phase_index\":{value2}," + $"\"total_phases\":{value}," + "\"controllable\":" + (flag8 ? "true" : "false") + ",\"knocked_down\":" + (flag9 ? "true" : "false") + ",\"shield_active\":" + (flag4 ? "true" : "false") + "," + $"\"shield_hp_pct\":{num24}," + $"\"hazard_unparryable\":{num25}," + $"\"hazard_nearest_dx\":{num26},\"hazard_nearest_dy\":{num27}," + $"\"hazard_type_explosion\":{num28},\"hazard_type_damagearea\":{num29}," + $"\"attack_nearest_dx\":{num30},\"attack_nearest_dy\":{num31}," + $"\"hazard_count\":{num32},\"hazard_type_danger\":{num33}," + $"\"dt\":{dt}," + "\"state\":\"" + text4 + "\",\"boss_dead\":" + (flag3 ? "true" : "false") + ",\"done\":" + (flag7 ? "true" : "false") + "}\n";
+			return "{" + $"\"px\":{x},\"py\":{y},\"vx\":{velX},\"vy\":{velY}," + string.Format("\"facing\":{0},\"grounded\":{1},", num, flag ? "true" : "false") + $"\"php\":{currentHealthValue},\"php_pct\":{num2},\"internal_injury\":{num3}," + $"\"qi\":{num4},\"qi_max\":{num5},\"qi_pct\":{num6}," + $"\"chi\":{num7},\"chi_max\":{num8},\"chi_pct\":{num9}," + $"\"potion_left\":{num10},\"potion_max\":{num11},\"potion_pct\":{num12}," + $"\"last_parry_result\":{s_lastParryResult},\"parry_count\":{s_parryCount},\"parry_enter_count\":{s_parryEnterCount}," + "\"boss_present\":" + (flag2 ? "true" : "false") + ",\"boss_name\":\"" + (((Object)(object)val != (Object)null) ? ((Object)val).name : "") + "\"," + $"\"bx\":{num13},\"by\":{num14},\"bvx\":{num15},\"bvy\":{num16}," + $"\"b_facing\":{num17},\"bdx\":{num46},\"bdy\":{num47}," + $"\"bhp\":{num18},\"bhp_pct\":{num19},\"bhp_max\":{num20}," + $"\"boss_fsm\":{num21}," + $"\"attack_category\":{num22}," + $"\"attack_id\":{num23}," + $"\"phase_index\":{value2}," + $"\"total_phases\":{value}," + "\"controllable\":" + (flag8 ? "true" : "false") + ",\"knocked_down\":" + (flag9 ? "true" : "false") + ",\"shield_active\":" + (flag4 ? "true" : "false") + "," + $"\"shield_hp_pct\":{num24}," + $"\"hazard_unparryable\":{num25}," + $"\"hazard_nearest_dx\":{num26},\"hazard_nearest_dy\":{num27}," + $"\"hazard_type_explosion\":{num28},\"hazard_type_damagearea\":{num29}," + $"\"attack_nearest_dx\":{num30},\"attack_nearest_dy\":{num31}," + $"\"hazard_count\":{num32},\"hazard_type_danger\":{num33}," + $"\"dt\":{dt}," + "\"state\":\"" + text4 + "\",\"boss_dead\":" + (flag3 ? "true" : "false") + ",\"done\":" + (flag7 ? "true" : "false") + "}\n";
 		}
 		catch (Exception ex)
 		{
-			((BaseUnityPlugin)this).Logger.LogError((object)ex);
+			Logger.LogError((object)ex);
 			return null;
 		}
 	}
@@ -1018,46 +1152,110 @@ public class Plugin : BaseUnityPlugin
 			}
 			int num2 = ExtractInt(json, "move");
 			_moveDir = ((num2 == 1) ? (-1) : ((num2 == 2) ? 1 : 0));
-			switch (ExtractInt(json, "dodge"))
+			s_moveDir = _moveDir;   // 2026-06-15 Round 21 fix: sync to static mirror for postfix
+			int dodge = ExtractInt(json, "dodge");
+			int attack = ExtractInt(json, "attack");
+			// 2026-06-15 Round 20: edge detection. WasPressed 只在「從非按到按」那 1 frame true;
+			// IsPressed/pulse 維持按住期間 true。避免 hold pattern 被 game 誤認連續按多次。
+			switch (dodge)
 			{
 			case 1:
-			{
-				bool flag = false;
-				try
+				_jumpPulse = PULSE;
+				s_jumpPulse = _jumpPulse;
+				if (_prevDodge != 1)
 				{
-					flag = (Object)(object)Player.i != (Object)null && ((Actor)Player.i).IsOnGround;
+					_jumpEdge = 1;
+					s_jumpEdge = 1;
 				}
-				catch
+				break;
+			case 2:
+				_dashPulse = PULSE;
+				s_dashPulse = _dashPulse;
+				if (_prevDodge != 2)
 				{
-				}
-				if (flag || _jumpPulse == 0)
-				{
-					_jumpPulse = 3;
+					_dashEdge = 1;
+					s_dashEdge = 1;
 				}
 				break;
 			}
-			case 2:
-				_dashPulse = 3;
-				break;
+			_prevDodge = dodge;
+			// 2026-06-15 Round 21: 蓄力擊 lock 進行中 → 整個 attack switch 跳過。
+			// 避免 case 1(_meleePulse=10)、case 2/3/4/5(自己的 edge)中斷 charge。
+			// _prevAttack 也不更新,lock 結束後 edge detection 仍正常運作。
+			if (_chargeLockFrames > 0)
+			{
+				_bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
+				return;
 			}
-			switch (ExtractInt(json, "attack"))
+			switch (attack)
 			{
 			case 1:
-				_meleePulse = 3;
+				// 雙重保護:Math.Max 不覆寫較大 _meleePulse(防 lock 邊界 race)
+				if (_meleePulse < PULSE)
+				{
+					_meleePulse = PULSE;
+					s_meleePulse = _meleePulse;
+				}
+				if (_prevAttack != 1)
+				{
+					_meleeEdge = 1;
+					s_meleeEdge = 1;
+				}
 				break;
 			case 2:
-				_rangedPulse = 3;
+				_rangedPulse = PULSE;
+				s_rangedPulse = _rangedPulse;
+				if (_prevAttack != 2)
+				{
+					_rangedEdge = 1;
+					s_rangedEdge = 1;
+				}
 				break;
 			case 3:
-				_parryPulse = 3;
+				_parryPulse = PULSE;
+				s_parryPulse = _parryPulse;
+				if (_prevAttack != 3)
+				{
+					_parryEdge = 1;
+					s_parryEdge = 1;
+				}
 				break;
 			case 4:
-				_talismanPulse = 3;
+				_talismanPulse = PULSE;
+				s_talismanPulse = _talismanPulse;
+				if (_prevAttack != 4)
+				{
+					_talismanEdge = 1;
+					s_talismanEdge = 1;
+				}
 				break;
 			case 5:
-				_healPulse = 3;
+				_healPulse = PULSE;
+				s_healPulse = _healPulse;
+				if (_prevAttack != 5)
+				{
+					_healEdge = 1;
+					s_healEdge = 1;
+				}
+				break;
+			case 6:
+				// 2026-06-15 Round 23 v4: case 6 = case 1 alias(defensive fallback)。
+				// env.py 端把 attack=6 macro 拆 attack=1 × 40 + attack=0 × 50 給 Plugin,
+				// Plugin 走已驗證 work 的 case 1 path。case 6 留著只是萬一 raw socket 直接送
+				// attack=6(例如老 test script)時行為合理。
+				if (_meleePulse < PULSE)
+				{
+					_meleePulse = PULSE;
+					s_meleePulse = _meleePulse;
+				}
+				if (_prevAttack != 6)
+				{
+					_meleeEdge = 1;
+					s_meleeEdge = 1;
+				}
 				break;
 			}
+			_prevAttack = attack;
 			_bossHpScale = ExtractFloat(json, "boss_hp_scale", _bossHpScale);
 		}
 		catch
@@ -1073,6 +1271,8 @@ public class Plugin : BaseUnityPlugin
 		}
 		_lastResetTime = Time.time;
 		_moveDir = 0;
+		s_moveDir = 0;   // 2026-06-15 Round 21 fix: keep static mirror in sync
+		_chargeLockFrames = 0;   // 2026-06-15 Round 21: 釋放蓄力 lock
 		_jumpPulse = (_dashPulse = (_meleePulse = (_rangedPulse = (_parryPulse = (_talismanPulse = (_healPulse = 0))))));
 		try
 		{
@@ -1080,7 +1280,7 @@ public class Plugin : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			((BaseUnityPlugin)this).Logger.LogError((object)("[reset] " + ex));
+			Logger.LogError((object)("[reset] " + ex));
 		}
 	}
 

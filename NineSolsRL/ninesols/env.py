@@ -13,7 +13,12 @@ from gymnasium import spaces
 
 from .bridge import GameBridge
 from .rewards import (compute_reward, W_BOSS_ENGAGED, W_TRUNCATION,
-                      BURST_WINDOW_STEPS, W_BURST_PENALTY, W_SPEED_BONUS)
+                      BURST_WINDOW_STEPS, W_BURST_PENALTY, W_SPEED_BONUS,
+                      W_PARRY_ATTEMPT)
+
+# Round 22: parry attempt incentive 的 recovery filter window(step,30Hz)
+# ~0.5s,涵蓋 ranged / melee / dash / heal 後搖,避免 spam parry farm 分
+PARRY_RECOVERY_WINDOW = 15
 
 # observation 各維度的正規化尺度
 POS_SCALE = 1000.0   # 相對座標
@@ -65,13 +70,15 @@ class NineSolsEnv(gym.Env):
     OBS_DIM = 17 + N_ATTACK_CATEGORIES + N_ATTACK_IDS + 11   # = 17 + 8 + 20 + 11 = 56
 
     def __init__(self, host: str = "127.0.0.1", port: int = 19271,
-                 max_steps: int = 1500):
+                 max_steps: int = 1200):
         super().__init__()
         self.bridge = GameBridge(host, port)
         self.max_steps = max_steps
 
-        # action：move(停/左/右) × dodge(無/跳/衝刺) × attack(無/近戰/遠程/格檔/貼符/喝藥)
-        self.action_space = spaces.MultiDiscrete([3, 3, 6])
+        # action：move(停/左/右) × dodge(無/跳/衝刺) × attack(無/近戰/遠程/格檔/貼符/喝藥/蓄力擊)
+        # 2026-06-15 Round 21: attack 維度 6→7,加 attack=6 = 蓄力擊 macro
+        # (Plugin 端內部送 70 frame hold = 1s 蓄力 + 自動釋放,解破盾)
+        self.action_space = spaces.MultiDiscrete([3, 3, 7])
 
         self.observation_space = spaces.Box(
             low=-10.0, high=10.0, shape=(self.OBS_DIM,), dtype=np.float32)
@@ -93,6 +100,27 @@ class NineSolsEnv(gym.Env):
         # rebuilt 2026-06-14: 本回合開場的累積 parry 計數（ep-end 取 delta = 本場次數）
         self._ep_start_parry_atm = 0   # parry_enter_count（嘗試）
         self._ep_start_parry_ok = 0    # parry_count（成功）
+        self._ep_parry_precise = 0     # 本場精確 parry 次數
+        self._ep_parry_imprecise = 0   # 本場不精確 parry 次數
+        # 2026-06-15 Round 21: per-episode CSV 用,terminal 不印
+        # v3: ranged/heal/chi 改用 state delta(game-side 真實事件),不是 action 意圖。
+        # charged/double_jump 留 action 端(state 端沒乾淨訊號)。
+        self._ep_ranged_count = 0      # ranged_ammo 遞減事件數(game-side 真射出)
+        self._ep_heal_count = 0        # potion_left 遞減事件數(game-side 真喝藥)
+        self._ep_chi_gain = 0          # chi 遞增事件數(parry / kill 累積)
+        self._ep_chi_spend = 0         # chi 遞減事件數(talisman / 蒼砂 釋放)
+        self._ep_charged_count = 0     # attack=6 edge 數(policy 意圖,not game-side)
+        self._ep_double_jump_count = 0 # 空中按跳 edge 數
+        self._prev_act_dodge = 0       # 前一步 dodge 值(edge detection)
+        self._prev_act_attack = 0      # 前一步 attack 值(edge detection)
+        # 2026-06-15 Round 21 v5: 蓄力擊 Python 端 lock,attack=6 後強制 attack=0 多撐 N 步,
+        # 避免 Plugin lock 結束剛好 Python 送新 input 截斷釋放動畫。
+        # 90 step @ 30Hz = 3s(對齊 Plugin _chargeLockFrames=180 game frame = 3s)
+        self._charge_macro_lock = 0
+        # 2026-06-15 Round 22: parry attempt incentive 的 recovery 偵測。
+        # 自己 ranged/melee/dash/heal 後 PARRY_RECOVERY_WINDOW step 內按 parry 不算 attempt
+        # (那段時間 game 不會處理 parry,只是把 step 浪費掉)。
+        self._last_recovery_step = -999
 
         # curriculum 狀態
         self._boss_hp_scale = CURRICULUM_START
@@ -152,7 +180,7 @@ class NineSolsEnv(gym.Env):
         return {
             "move":   int(action[0]),   # 0停 1左 2右
             "dodge":  int(action[1]),   # 0無 1跳 2衝刺
-            "attack": int(action[2]),   # 0無 1近戰 2遠程 3格檔 4貼符 5喝藥
+            "attack": int(action[2]),   # 0無 1近戰 2遠程 3格檔 4貼符 5喝藥 6蓄力擊
         }
 
     # ---- curriculum ----
@@ -180,7 +208,6 @@ class NineSolsEnv(gym.Env):
 
         # v1.20: max_steps 隨 curriculum 等比放大，讓 truncation 永遠 = 真失敗，
         # 不會在 scale 升高後因為「時間天花板太低」誤罰認真打的 agent。
-        # scale=0.10: 2800 (~93s)、scale=0.50: 6000 (~200s)、scale=1.00: 10000 (~333s)
         self._effective_max_steps = int(self.max_steps * (1.0 + 4.0 * self._boss_hp_scale))
 
         # 要求 mod 重置：呼叫 Player.Suicide() → memory mode 死亡會自動重啟此場 boss 戰
@@ -197,8 +224,21 @@ class NineSolsEnv(gym.Env):
 
         self._milestones_hit = set()  # 里程碑門檻歸零（新 episode + phase 1）
         self._last_hit_step = -999  # v1.20.1: burst penalty 狀態歸零
+        self._last_recovery_step = -999  # Round 22: parry attempt recovery 狀態歸零
         self._phase_count = 1  # v2.0.0: 新 episode 從 phase 1 起算
         self._episode_return = 0.0  # 累計 raw reward 歸零
+        self._ep_parry_precise = 0
+        self._ep_parry_imprecise = 0
+        # 2026-06-15 Round 21: 重置所有 per-ep 計數
+        self._ep_ranged_count = 0
+        self._ep_heal_count = 0
+        self._ep_chi_gain = 0
+        self._ep_chi_spend = 0
+        self._ep_charged_count = 0
+        self._ep_double_jump_count = 0
+        self._prev_act_dodge = 0
+        self._prev_act_attack = 0
+        self._charge_macro_lock = 0
         # boss 若在 reset 當下已在場 → 視為本局已接戰（不發 bonus、不啟動資源限制）
         self._boss_engaged = bool(s.get("boss_present"))
         # rebuilt 2026-06-14: 記下開場的累積 parry 計數（遊戲端累積值，ep-end 取差）
@@ -219,7 +259,8 @@ class NineSolsEnv(gym.Env):
         # 接戰前禁用消耗性資源動作：長程(ammo)/喝藥(potion) 都是有限數量且不在 obs 裡，
         # boss 戰前的長游走會把它們耗光。用 sticky 的 _boss_engaged（非即時 boss_present）
         # → boss 偵測 flicker 免疫，一旦接戰過就永久解除、戰鬥中絕不誤擋。
-        if not self._boss_engaged and act["attack"] in (2, 3, 5):
+        # 2026-06-15 Round 21: 加 attack=6(蓄力擊)到 pre-engage block,沒 boss 時不准蓄力浪費 1s
+        if not self._boss_engaged and act["attack"] in (2, 3, 5, 6):
             act["attack"] = 0
 
         # rebuilt 4f38deb 2026-06-13: 滿血(php_pct >= 99%)時禁止喝藥(attack=5)，
@@ -229,12 +270,71 @@ class NineSolsEnv(gym.Env):
                 and self._prev_raw.get("php_pct", 1.0) >= 0.99:
             act["attack"] = 0
 
+        # 2026-06-15 Round 23 v4: attack=6 macro 拆 attack=1 × 40 + attack=0 × 50。
+        # 走 Plugin 已驗證 work 的 case 1 path(test_charged_attack 同 pattern):
+        #   step N(agent attack=6):lock=89, act改 1 → Plugin case 1 第一步,_meleeEdge 觸發
+        #   step N+1 ~ N+39:lock 89→50, act 改 1 → case 1 refresh _meleePulse=PULSE 每 step
+        #   step N+40 ~ N+89:lock 49→0, act 改 0 → Plugin pulse 自然衰減 → release fire
+        # 90 step ≈ 3s 總時長(40 hold + 50 release window)。
+        if self._charge_macro_lock > 0:
+            self._charge_macro_lock -= 1
+            if self._charge_macro_lock >= 50:    # 89..50 = 40 step hold phase
+                act["attack"] = 1
+            else:                                  # 49..0 = 50 step release window
+                act["attack"] = 0
+        elif act["attack"] == 6:
+            self._charge_macro_lock = 89   # 40 hold(含當前 step)+ 50 release
+            act["attack"] = 1               # 當前 step 就是 hold 第 1 步
+
+        # 2026-06-15 Round 22: parry attempt incentive(conditional + edge + recovery filter)
+        # 條件 AND:
+        #   - prev_cat 1-5(boss 在 windup/attacking,真有威脅才該 parry)
+        #   - attack=3 edge(self._prev_act_attack != 3,避免連按賺分)
+        #   - 非自己動作後搖期(ranged/melee/dash/heal 後 ~0.5s 內 parry 無效)
+        if act["attack"] in (1, 2, 5) or act["dodge"] == 2:
+            self._last_recovery_step = self._steps
+        in_recovery = (self._steps - self._last_recovery_step) < PARRY_RECOVERY_WINDOW
+        prev_cat = int(self._prev_raw.get("attack_category", 0)) if self._prev_raw else 0
+        parry_attempt_bonus = 0.0
+        if (1 <= prev_cat <= 5
+                and act["attack"] == 3
+                and self._prev_act_attack != 3
+                and not in_recovery):
+            parry_attempt_bonus = W_PARRY_ATTEMPT
+
+        # 2026-06-15 Round 21 v3: charged / double_jump 仍 action edge(state 端無乾淨訊號)
+        if act["attack"] == 6 and self._prev_act_attack != 6:
+            self._ep_charged_count += 1
+        # 雙跳:dodge=1 edge,且上一幀 player 不在地面(從一跳起跳開始的「第二次按跳」)
+        if act["dodge"] == 1 and self._prev_act_dodge != 1 \
+                and self._prev_raw is not None \
+                and not self._prev_raw.get("grounded", True):
+            self._ep_double_jump_count += 1
+        self._prev_act_dodge = act["dodge"]
+        self._prev_act_attack = act["attack"]
+
         self.bridge.send_action(act)
         s = self.bridge.recv_state()
         self._steps += 1
 
+        # 2026-06-15 Round 21 v3: ranged / heal / chi 用 state delta 觀察(game-side 真實事件)
+        if self._prev_raw is not None:
+            d_ammo = float(s.get("ranged_ammo", 0)) - float(self._prev_raw.get("ranged_ammo", 0))
+            if d_ammo <= -0.5:        # 蒼砂 -1 → ranged 真射出
+                self._ep_ranged_count += 1
+            d_potion = int(s.get("potion_left", 0)) - int(self._prev_raw.get("potion_left", 0))
+            if d_potion <= -1:        # 藥水 -1 → 真喝了
+                self._ep_heal_count += 1
+            d_chi = float(s.get("chi", 0)) - float(self._prev_raw.get("chi", 0))
+            if d_chi >= 0.5:          # chi 真累積 +1(parry / kill 補)
+                self._ep_chi_gain += 1
+            elif d_chi <= -0.5:       # chi 真消耗(talisman / 蒼砂 釋放)
+                self._ep_chi_spend += 1
+
         # v1.20.2: quadratic hurt penalty (取代 linear+cap),compute_reward 改單一回傳
         reward = compute_reward(self._prev_raw, s)
+        # 2026-06-15 Round 22: parry attempt 條件性 incentive(spam-proof,見上方 gate)
+        reward += parry_attempt_bonus
 
         # v1.20.1: burst damage penalty —— 短時間內連續挨打額外扣分（不進 hurt-cap）
         # 解 W_MAX_HURT_PENALTY 上限後致命一擊沒訊號的問題（phase 2 close-out 死亡）
@@ -284,6 +384,12 @@ class NineSolsEnv(gym.Env):
         if terminated and s.get("boss_dead"):
             time_fraction = self._steps / max(1, self._effective_max_steps)
             reward += W_SPEED_BONUS * (1.0 - time_fraction)
+        if self._prev_raw is not None and s.get("parry_count", 0) > self._prev_raw.get("parry_count", 0):
+            parry_result = int(s.get("last_parry_result", 0))
+            if parry_result >= 2:
+                self._ep_parry_precise += 1
+            elif parry_result == 1:
+                self._ep_parry_imprecise += 1
         self._prev_raw = s
         self._episode_return += float(reward)  # 累計 raw reward,ep-end log 用
 
@@ -296,18 +402,31 @@ class NineSolsEnv(gym.Env):
             parry_ok  = int(s.get("parry_count", 0)) - self._ep_start_parry_ok
             total_phases = int(s.get("total_phases", 1))
             # ep-end 尾巴：每欄獨立 key=value（CSV 友善，不用斜線）
-            ep_extra = (f"| parry={parry_ok} atm={parry_atm} "
+            ep_extra = (f"| parry_count={parry_ok} attempt={parry_atm} "
+                        f"parry_precise={self._ep_parry_precise} "
+                        f"parry_imprecise={self._ep_parry_imprecise} "
                         f"chi={s.get('chi', 0):.0f} phase={self._phase_count}/{total_phases} "
                         f"| bhp={s.get('bhp', 0):.0f} bhp%={s.get('bhp_pct', 0):.0%} ")
             # per-episode CSV 用（EpisodeCSVCallback 會再補 total_timesteps）
             ep_summary = {
                 "scale": round(float(self._boss_hp_scale), 4), "won": int(won),
                 "steps": self._steps, "ret": round(float(self._episode_return), 2),
-                "parry_ok": parry_ok, "parry_atm": parry_atm,
+                "parry_count": parry_ok, "attempt": parry_atm,
+                "parry_precise": self._ep_parry_precise,
+                "parry_imprecise": self._ep_parry_imprecise,
                 "chi": int(s.get("chi", 0)), "phase": self._phase_count,
                 "total_phases": total_phases,
                 "bhp": round(float(s.get("bhp", 0)), 1),
                 "bhp_pct": round(float(s.get("bhp_pct", 0)), 4),
+                # 2026-06-15 Round 21 v3: per-episode CSV 欄位(terminal 不印)
+                # ranged/heal/chi_gain/chi_spend = game-side 真實事件(state delta)
+                # charged/double_jump = policy 意圖(action edge)
+                "ranged": self._ep_ranged_count,
+                "heal": self._ep_heal_count,
+                "chi_gain": self._ep_chi_gain,
+                "chi_spend": self._ep_chi_spend,
+                "charged": self._ep_charged_count,
+                "double_jump": self._ep_double_jump_count,
             }
             if not self._first_episode_done:
                 # v1.20.1: 首次 episode 是 train.py 啟動 Suicide 後的「測試 episode」，

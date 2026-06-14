@@ -138,7 +138,7 @@ def main():
     # callback:ckpt(含 vecnormalize + sil buffer)+ recorder
     ckpt_cb = SILBufferCheckpointCallback(
         sil_buffer=sil_buffer,
-        save_freq=102400,
+        save_freq=40960,
         save_path=CKPT_DIR,
         name_prefix=NAME_PREFIX,
         save_vecnormalize=True,

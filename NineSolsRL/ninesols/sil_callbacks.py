@@ -79,6 +79,19 @@ class SILEpisodeRecorderCallback(BaseCallback):
                        and phase_count >= total_phases
                        and bhp_pct_end < self.NEAR_WIN_BHP_PCT)
 
+        # 2026-06-15 Round 21: SIL 只學最終階段(phase_count >= total_phases)trajectory。
+        # WIN 隱含最終階段(boss 死了),NEAR 已自帶此條件,HIGH 之前沒擋 → phase 1 ret 新高
+        # 也會 admit,SIL 會學「達到 phase 1 終點就死」的垃圾 pattern。加 gate 排除。
+        in_final_phase = phase_count >= total_phases
+        if not is_win and not in_final_phase:
+            if self.verbose >= 1:
+                print(f"[sil] skip phase {phase_count}/{total_phases} "
+                      f"ret={self._return_raw:.1f}(非最終階段,丟棄)")
+            self._obs_seq.clear()
+            self._act_seq.clear()
+            self._return_raw = 0.0
+            return
+
         obs_arr = np.stack(self._obs_seq, axis=0).astype(np.float32)
         act_arr = np.stack(self._act_seq, axis=0).astype(np.int64)
         admitted = self.buffer.add_episode(
