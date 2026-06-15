@@ -1,43 +1,75 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>NineSolsRL</AssemblyName>
     <LangVersion>10.0</LangVersion>
   </PropertyGroup>
 
+  <!-- ===== 遊戲路徑解析(泛用化,取代寫死的 HintPath)=====
+       解析優先序,任一步找到「存在 NineSols_Data\Managed」即採用:
+         1. 環境變數 NINESOLS_DIR 或 dotnet build -p:NineSolsDir=...(保證可用的覆寫管道)
+         2. 登錄檔抓 Steam 主程式庫 → ...\steamapps\common\Nine Sols
+         3. 探測常見 Steam library 候選(找不到自己加一行 <NineSolsDir Condition=... /> 即可)
+       都失敗 → build 前由 CheckNineSolsDir 報清楚的錯誤。 -->
+  <PropertyGroup>
+    <!-- 1. 環境變數覆寫(-p:NineSolsDir 會直接設 $(NineSolsDir),優先於此) -->
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and '$(NINESOLS_DIR)'!=''">$(NINESOLS_DIR)</NineSolsDir>
+
+    <!-- 2. 登錄檔 Steam 主程式庫(best-effort;抓不到回空字串,解析鏈往下走) -->
+    <_SteamPath>$([MSBuild]::GetRegistryValueFromView('HKEY_CURRENT_USER\SOFTWARE\Valve\Steam', 'SteamPath', '', RegistryView.Registry64, RegistryView.Registry32))</_SteamPath>
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and '$(_SteamPath)'!='' and Exists('$(_SteamPath)\steamapps\common\Nine Sols\NineSols_Data\Managed')">$(_SteamPath)\steamapps\common\Nine Sols</NineSolsDir>
+
+    <!-- 3. 常見 Steam library 候選位置 -->
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and Exists('E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed')">E:\SteamLibrary\steamapps\common\Nine Sols</NineSolsDir>
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and Exists('C:\Program Files (x86)\Steam\steamapps\common\Nine Sols\NineSols_Data\Managed')">C:\Program Files (x86)\Steam\steamapps\common\Nine Sols</NineSolsDir>
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and Exists('D:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed')">D:\SteamLibrary\steamapps\common\Nine Sols</NineSolsDir>
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and Exists('D:\Steam\steamapps\common\Nine Sols\NineSols_Data\Managed')">D:\Steam\steamapps\common\Nine Sols</NineSolsDir>
+    <NineSolsDir Condition="'$(NineSolsDir)'=='' and Exists('F:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed')">F:\SteamLibrary\steamapps\common\Nine Sols</NineSolsDir>
+
+    <!-- 衍生子資料夾:10 個 HintPath 都從這兩個組出來 -->
+    <ManagedDir>$(NineSolsDir)\NineSols_Data\Managed</ManagedDir>
+    <BepInExCoreDir>$(NineSolsDir)\BepInEx\core</BepInExCoreDir>
+  </PropertyGroup>
+
+  <!-- 找不到遊戲路徑 → 在解析參考前就報錯,給清楚的修正指引 -->
+  <Target Name="CheckNineSolsDir" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(NineSolsDir)'=='' or !Exists('$(ManagedDir)')"
+           Text="找不到 Nine Sols 安裝路徑。請設環境變數 NINESOLS_DIR,或用 dotnet build -p:NineSolsDir=&quot;X:\path\to\Nine Sols&quot;。目前偵測到 NineSolsDir='$(NineSolsDir)'" />
+  </Target>
+
   <ItemGroup>
     <Reference Include="BepInEx">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\BepInEx\core\BepInEx.dll</HintPath>
+      <HintPath>$(BepInExCoreDir)\BepInEx.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>$(ManagedDir)\UnityEngine.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(ManagedDir)\UnityEngine.CoreModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.Physics2DModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UnityEngine.Physics2DModule.dll</HintPath>
+      <HintPath>$(ManagedDir)\UnityEngine.Physics2DModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.AnimationModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+      <HintPath>$(ManagedDir)\UnityEngine.AnimationModule.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.AudioModule">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UnityEngine.AudioModule.dll</HintPath>
+      <HintPath>$(ManagedDir)\UnityEngine.AudioModule.dll</HintPath>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(ManagedDir)\Assembly-CSharp.dll</HintPath>
     </Reference>
     <Reference Include="InControl">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\InControl.dll</HintPath>
+      <HintPath>$(ManagedDir)\InControl.dll</HintPath>
     </Reference>
     <Reference Include="rcg.rcgmakercore.Runtime">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\rcg.rcgmakercore.Runtime.dll</HintPath>
+      <HintPath>$(ManagedDir)\rcg.rcgmakercore.Runtime.dll</HintPath>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>$(BepInExCoreDir)\0Harmony.dll</HintPath>
     </Reference>
     <Reference Include="UniTask">
-      <HintPath>E:\SteamLibrary\steamapps\common\Nine Sols\NineSols_Data\Managed\UniTask.dll</HintPath>
+      <HintPath>$(ManagedDir)\UniTask.dll</HintPath>
     </Reference>
   </ItemGroup>
 </Project>
