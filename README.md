@@ -1,7 +1,7 @@
 # NineSols RL — 用強化學習打《九日 / Nine Sols》Boss
 
 此專案讓 Agent 透過 **強化學習 (PPO + Self-Imitation Learning)** 學會擊敗《Nine Sols》的 Boss。
-
+<img src="./NineSolsRL/NineSols_train.gif" width="400" height="250" alt="訓練過程">
 ## 0. 架構
 分成兩半,中間用 **TCP** 橋接:
 
@@ -271,7 +271,7 @@ Ninesols_rl/
 ### TL;DR 最短路徑
 
 ```powershell
-# 1) 編譯並安裝 mod (改好 csproj 的 HintPath 後)
+# 1) 編譯並安裝 mod
 cd NineSolsRL
 dotnet build -c Release
 # 把 bin\Release\netstandard2.1\NineSolsRL.dll 複製到 遊戲\BepInEx\plugins\
