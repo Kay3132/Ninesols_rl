@@ -107,8 +107,8 @@ class NineSolsEnv(gym.Env):
         # charged/double_jump 留 action 端(state 端沒乾淨訊號)。
         self._ep_ranged_count = 0      # ranged_ammo 遞減事件數(game-side 真射出)
         self._ep_heal_count = 0        # potion_left 遞減事件數(game-side 真喝藥)
-        self._ep_chi_gain = 0          # chi 遞增事件數(parry / kill 累積)
-        self._ep_chi_spend = 0         # chi 遞減事件數(talisman / 蒼砂 釋放)
+        self._ep_chi_gain = 0          # chi 累積增加量(parry / kill 補,累加 delta)
+        self._ep_chi_spend = 0         # chi 累積消耗量(talisman / 蒼砂 釋放,累加 delta)
         self._ep_charged_count = 0     # attack=6 edge 數(policy 意圖,not game-side)
         self._ep_double_jump_count = 0 # 空中按跳 edge 數
         self._prev_act_dodge = 0       # 前一步 dodge 值(edge detection)
@@ -327,10 +327,13 @@ class NineSolsEnv(gym.Env):
             if d_potion <= -1:        # 藥水 -1 → 真喝了
                 self._ep_heal_count += 1
             d_chi = float(s.get("chi", 0)) - float(self._prev_raw.get("chi", 0))
-            if d_chi >= 0.5:          # chi 真累積 +1(parry / kill 補)
-                self._ep_chi_gain += 1
-            elif d_chi <= -0.5:       # chi 真消耗(talisman / 蒼砂 釋放)
-                self._ep_chi_spend += 1
+            # 2026-06-15 fix: 累加「氣的量」而非「事件次數」。原本 +=1 只數跳動次數,
+            # 一次 +2 gain(1 次)拆成兩幀 -1 spend(2 次)會讓 spend>gain;改累加
+            # delta 後,只要開場氣為 0,本場 chi_spend 必然 <= chi_gain。
+            if d_chi > 0:
+                self._ep_chi_gain += d_chi      # 累加實際增加量
+            elif d_chi < 0:
+                self._ep_chi_spend += -d_chi    # 累加實際消耗量
 
         # v1.20.2: quadratic hurt penalty (取代 linear+cap),compute_reward 改單一回傳
         reward = compute_reward(self._prev_raw, s)
@@ -406,7 +409,7 @@ class NineSolsEnv(gym.Env):
             ep_extra = (f"| parry_count={parry_ok} attempt={parry_atm} "
                         f"parry_precise={self._ep_parry_precise} "
                         f"parry_imprecise={self._ep_parry_imprecise} "
-                        f"chi={s.get('chi', 0):.0f} phase={self._phase_count}/{total_phases} "
+                        f"phase={self._phase_count}/{total_phases} "
                         f"| bhp={s.get('bhp', 0):.0f} bhp%={s.get('bhp_pct', 0):.0%} ")
             # per-episode CSV 用（EpisodeCSVCallback 會再補 total_timesteps）
             ep_summary = {
@@ -415,7 +418,7 @@ class NineSolsEnv(gym.Env):
                 "parry_count": parry_ok, "attempt": parry_atm,
                 "parry_precise": self._ep_parry_precise,
                 "parry_imprecise": self._ep_parry_imprecise,
-                "chi": int(s.get("chi", 0)), "phase": self._phase_count,
+                "phase": self._phase_count,
                 "total_phases": total_phases,
                 "bhp": round(float(s.get("bhp", 0)), 1),
                 "bhp_pct": round(float(s.get("bhp_pct", 0)), 4),
@@ -424,8 +427,8 @@ class NineSolsEnv(gym.Env):
                 # charged/double_jump = policy 意圖(action edge)
                 "ranged": self._ep_ranged_count,
                 "heal": self._ep_heal_count,
-                "chi_gain": self._ep_chi_gain,
-                "chi_spend": self._ep_chi_spend,
+                "chi_gain": int(round(self._ep_chi_gain)),
+                "chi_spend": int(round(self._ep_chi_spend)),
                 "charged": self._ep_charged_count,
                 "double_jump": self._ep_double_jump_count,
             }
