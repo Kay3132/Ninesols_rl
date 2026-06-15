@@ -107,6 +107,7 @@ class NineSolsEnv(gym.Env):
         # charged/double_jump 留 action 端(state 端沒乾淨訊號)。
         self._ep_ranged_count = 0      # ranged_ammo 遞減事件數(game-side 真射出)
         self._ep_heal_count = 0        # potion_left 遞減事件數(game-side 真喝藥)
+        self._ep_heal_dphp_sum = 0.0   # 整場恢復的 HP% 總量(/heal_count = avg_heal_pct)
         self._ep_chi_gain = 0          # chi 累積增加量(parry / kill 補,累加 delta)
         self._ep_chi_spend = 0         # chi 累積消耗量(talisman / 蒼砂 釋放,累加 delta)
         self._ep_charged_count = 0     # attack=6 edge 數(policy 意圖,not game-side)
@@ -232,6 +233,7 @@ class NineSolsEnv(gym.Env):
         # 2026-06-15 Round 21: 重置所有 per-ep 計數
         self._ep_ranged_count = 0
         self._ep_heal_count = 0
+        self._ep_heal_dphp_sum = 0.0
         self._ep_chi_gain = 0
         self._ep_chi_spend = 0
         self._ep_charged_count = 0
@@ -326,6 +328,10 @@ class NineSolsEnv(gym.Env):
             d_potion = int(s.get("potion_left", 0)) - int(self._prev_raw.get("potion_left", 0))
             if d_potion <= -1:        # 藥水 -1 → 真喝了
                 self._ep_heal_count += 1
+            # avg_heal_pct 用:累加整場正向 php_pct 變化(boss 戰中正向 dphp 僅來自喝藥)。
+            d_php = float(s.get("php_pct", 1.0)) - float(self._prev_raw.get("php_pct", 1.0))
+            if d_php > 0:
+                self._ep_heal_dphp_sum += d_php
             d_chi = float(s.get("chi", 0)) - float(self._prev_raw.get("chi", 0))
             # 2026-06-15 fix: 累加「氣的量」而非「事件次數」。原本 +=1 只數跳動次數,
             # 一次 +2 gain(1 次)拆成兩幀 -1 spend(2 次)會讓 spend>gain;改累加
@@ -427,6 +433,9 @@ class NineSolsEnv(gym.Env):
                 # charged/double_jump = policy 意圖(action edge)
                 "ranged": self._ep_ranged_count,
                 "heal": self._ep_heal_count,
+                # 本場平均單次回血比例；驗證 quadratic heal 的 dphp 是否有變化
+                "avg_heal_pct": (round(self._ep_heal_dphp_sum / self._ep_heal_count, 4)
+                                 if self._ep_heal_count else 0.0),
                 "chi_gain": int(round(self._ep_chi_gain)),
                 "chi_spend": int(round(self._ep_chi_spend)),
                 "charged": self._ep_charged_count,
