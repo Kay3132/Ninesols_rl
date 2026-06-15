@@ -28,7 +28,7 @@ W_SPEED_BONUS  = 200.0
 #   - 重擊 (50%) = 37.5 點（舊 cap=10）
 #   - 致命 (100%) = 150 點
 # 訊號連續、不需 cap、不需 cumulative_hurt 追蹤。burst penalty 仍保留抓 combo。
-W_PLAYER_HURT_Q = 130.0   # rebuilt 9046049 2026-06-13: → 130 (rose R17)。quadratic 係數,r -= W_PLAYER_HURT_Q * dphp^2
+W_PLAYER_HURT_Q = 120.0   # 2026-06-15: 130 → 120(降挨打懲罰)。quadratic 係數,r -= W_PLAYER_HURT_Q * dphp^2
 
 # v1.20.1: burst damage penalty —— 短時間連續挨打(連段)額外懲罰，獨立 stream
 # quadratic 對「連 5 擊」跟「散 5 擊」給同樣分,burst 仍負責抓 combo 訊號
@@ -43,9 +43,10 @@ W_PARRY_IMPRECISE = 20.0   # 不精確格檔（v1.18.0: 1→5）
 W_HEAL_SUCCESS    = 35.0
 # rebuilt 2026-06-15 Round 22: 復活 Round 3/5 attempt incentive。
 # 純 success-only reward 對 fresh policy 是 chicken-and-egg(沒成功 → 不學 → 永遠不成功)。
-# 0.5 設計:單次 attempt 跟 W_TIME_PENALTY_PS=-0.3 同個量級,且 conditional
-# (只在 boss windup cat 1-5 + 非自己動作後搖期觸發),不會被 farm 成 spam local optimum。
-W_PARRY_ATTEMPT   = 0.5
+# 2026-06-15: 0.5 → 2.0,加大「嘗試 parry」誘因。gate 已 spam-proof(只在 boss
+# windup cat 1-5 + attack=3 edge + 非自己動作後搖期觸發),提高權重不會開出 spam
+# local optimum;且仍遠低於成功 parry 的 20/50,主梯度依舊指向「擋成功」而非「亂按」。
+W_PARRY_ATTEMPT   = 2.0
 
 # v1.18.0 防禦引導（v1.19.0: evade 8→2，降 per-second 主導性）
 W_EVADE_PS               = 2.0   # 每秒：boss 在 windup/attacking 且玩家在 range 內、這幀沒挨打 → 加分
