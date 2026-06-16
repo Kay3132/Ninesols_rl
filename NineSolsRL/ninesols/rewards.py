@@ -33,7 +33,7 @@ W_PLAYER_HURT_Q = 120.0   # 2026-06-15: 130 → 120(降挨打懲罰)。quadratic
 # v1.20.1: burst damage penalty —— 短時間連續挨打(連段)額外懲罰，獨立 stream
 # quadratic 對「連 5 擊」跟「散 5 擊」給同樣分,burst 仍負責抓 combo 訊號
 BURST_WINDOW_STEPS = 60   # rebuilt 75529b2 2026-06-13: 30 → 60 (~2s, rose R15)，抓長連段
-W_BURST_PENALTY    = 20.0 # rebuilt 75529b2 2026-06-13: 10 → 20 (rose R15)，提高連段挨打訊號
+W_BURST_PENALTY    = 15.0 # rebuilt 75529b2 2026-06-13: 10 → 20 (rose R15)，提高連段挨打訊號
 
 W_PARRY_PRECISE   = 50.0  # 精確格檔（v1.18.0: 5→20，格檔是稀有事件，單次給足夠分量）
 W_PARRY_IMPRECISE = 20.0   # 不精確格檔（v1.18.0: 1→5）
@@ -51,7 +51,7 @@ W_PARRY_ATTEMPT   = 2.0
 
 # v1.18.0 防禦引導（v1.19.0: evade 8→2，降 per-second 主導性）
 W_EVADE_PS               = 2.0   # 每秒：boss 在 windup/attacking 且玩家在 range 內、這幀沒挨打 → 加分
-W_PUNISH_HIT_DURING_WINDUP = 5.0  # 一次性：boss 有 windup 預警你還挨打 → 額外扣分（獨立於 hurt-cap）
+W_PUNISH_HIT_DURING_WINDUP = 0.0  # 一次性：boss 有 windup 預警你還挨打 → 額外扣分（獨立於 hurt-cap）
 
 # --- instrumental：per-step 項一律改「每秒速率」，compute_reward 內乘 dt ---
 # 為什麼改 dt-based：原本「每步固定值」在遊戲加速 / fps 抖動時，「每秒幾步」

@@ -354,6 +354,27 @@ public class Plugin : BaseUnityPlugin
 		}
 	}
 
+	// 2026-06-16 Round 26 fix v2: 只擋 cutscene / scripted,不擋 player state machine
+	// (在 attack/dodge state 期間仍允許輸入,模擬真實鍵盤可打斷自己動作的行為)。
+	// 跟 IsPlayerControllable 差別:不檢查 p.CurrentStateType。
+	internal static bool IsGameInteractable(Player p)
+	{
+		try
+		{
+			if (p == null || (Object)(object)p == (Object)null) return false;
+			PlayerInputBinder playerInput = p.playerInput;
+			if ((Object)(object)playerInput == (Object)null || (int)playerInput.currentStateType != 0) return false;
+			if (p.IsScriptedMove) return false;
+			if (p.lockMoving) return false;
+			if ((Object)(object)p.canMoveNode == (Object)null || !((Component)p.canMoveNode).gameObject.activeSelf) return false;
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
 	internal static bool IsPlayerControllable(Player p)
 	{
 		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
@@ -426,42 +447,40 @@ public class Plugin : BaseUnityPlugin
 		{
 			return;
 		}
+		// 2026-06-16 Round 26 v2: 用 IsGameInteractable(只擋 cutscene、scripted move、
+		// lockMoving、canMoveNode 不 active)而不是 IsPlayerControllable(會擋 player state)。
+		// 王出場演出時 input 不會跑進去(cutscene gate),但 player 在 attack/dodge state
+		// 期間 input 仍能 fake(讓 parry 取消輕擊動畫 → 進 ParryState)。
 		Player p = Player.i;
-		bool controllable = IsPlayerControllable(p);
-		bool hurtOrDown = !controllable && IsHurtOrDown(p);
-		// WasPressed 用 edge,只在「從非按到按」那 1 frame true。修連續 hold 被 game 誤認連按 N 次的 bug。
-		if (controllable)
+		if (!IsGameInteractable(p))
 		{
-			if (s_jumpEdge > 0 && __instance == actions.Jump)
-			{
-				__result = true;
-			}
-			else if (s_dashEdge > 0 && __instance == actions.Dodge)
-			{
-				__result = true;
-			}
-			else if (s_meleeEdge > 0 && __instance == actions.Attack)
-			{
-				__result = true;
-			}
-			else if (s_rangedEdge > 0 && __instance == actions.WeaponAttack)
-			{
-				__result = true;
-			}
-			else if (s_parryEdge > 0 && __instance == actions.Parry)
-			{
-				__result = true;
-			}
-			else if (s_talismanEdge > 0 && __instance == actions.FooAttack)
-			{
-				__result = true;
-			}
-			else if (s_healEdge > 0 && __instance == actions.Heal)
-			{
-				__result = true;
-			}
+			return;
 		}
-		else if (hurtOrDown && s_dashEdge > 0 && __instance == actions.Dodge)
+		if (s_jumpEdge > 0 && __instance == actions.Jump)
+		{
+			__result = true;
+		}
+		else if (s_dashEdge > 0 && __instance == actions.Dodge)
+		{
+			__result = true;
+		}
+		else if (s_meleeEdge > 0 && __instance == actions.Attack)
+		{
+			__result = true;
+		}
+		else if (s_rangedEdge > 0 && __instance == actions.WeaponAttack)
+		{
+			__result = true;
+		}
+		else if (s_parryEdge > 0 && __instance == actions.Parry)
+		{
+			__result = true;
+		}
+		else if (s_talismanEdge > 0 && __instance == actions.FooAttack)
+		{
+			__result = true;
+		}
+		else if (s_healEdge > 0 && __instance == actions.Heal)
 		{
 			__result = true;
 		}
@@ -478,12 +497,14 @@ public class Plugin : BaseUnityPlugin
 		{
 			return;
 		}
-		// 2026-06-15 Round 23 fix: 拿掉 IsPlayerControllable check —— 玩家在 Attack/Jump
-		// state 時 CurrentStateType != 0,IsPlayerControllable 回 false → postfix 提早 return
-		// → game 以為輕擊瞬間就鬆手 → light attack 結束後**無法**進入 Charging state。
-		// 真實鍵盤玩 game 時 IsPressed 是 input layer,跟 player state 無關。
-		// s_xxxPulse 自身是 macro 控制(case 6 才設 _meleePulse=120),沒 macro 時 = 0,
-		// 不會誤在 cutscene/death 期間發 fake input,安全。
+		// 2026-06-16 Round 26 v2: 加 IsGameInteractable gate 擋 cutscene(王出場演出時
+		// 不應該送 IsPressed=true 進去)。Round 23 拿掉 IsPlayerControllable 是對的
+		// (允許 attack state 期間 hold = 蓄力),但完全沒擋會在 cutscene 期間 leak。
+		Player p = Player.i;
+		if (!IsGameInteractable(p))
+		{
+			return;
+		}
 		// IsPressed 給 Jump(維持 variable jump height)+ Attack(蓄力擊破盾)
 		if (s_jumpPulse > 0 && __instance == actions.Jump)
 		{

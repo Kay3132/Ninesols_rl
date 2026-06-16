@@ -289,18 +289,12 @@ class NineSolsEnv(gym.Env):
             act["attack"] = 1               # 當前 step 就是 hold 第 1 步
             self._ep_charged_count += 1     # 每次 macro 觸發 +1(agent 真實意圖)
 
-        # 2026-06-15 Round 22: parry attempt incentive(conditional + edge + recovery filter)
-        # 條件 AND:
-        #   - prev_cat 1-5(boss 在 windup/attacking,真有威脅才該 parry)
-        #   - attack=3 edge(self._prev_act_attack != 3,避免連按賺分)
-        #   - 非自己動作後搖期(ranged/melee/dash/heal 後 ~0.5s 內 parry 無效)
+        # 2026-06-15 Round 24: parry attempt incentive(edge + recovery filter,取消 windup 限制)
         if act["attack"] in (1, 2, 5) or act["dodge"] == 2:
             self._last_recovery_step = self._steps
         in_recovery = (self._steps - self._last_recovery_step) < PARRY_RECOVERY_WINDOW
-        prev_cat = int(self._prev_raw.get("attack_category", 0)) if self._prev_raw else 0
         parry_attempt_bonus = 0.0
-        if (1 <= prev_cat <= 5
-                and act["attack"] == 3
+        if (act["attack"] == 3
                 and self._prev_act_attack != 3
                 and not in_recovery):
             parry_attempt_bonus = W_PARRY_ATTEMPT
