@@ -42,12 +42,24 @@ W_PARRY_IMPRECISE = 20.0   # 不精確格檔（v1.18.0: 1→5）
 # 小 top-off 幾乎無分、低血急救重賞 → 引導省藥 + 把受的傷補回來(挨傷 -120·dphp²
 # 與補血 +120·dphp² 完全對稱,淨回收)。env.py 已 mask 滿血(php_pct>=99%)attack=5。
 W_HEAL_SUCCESS_Q  = 120.0
+# 2026-06-24 Round 28: per-heal-event flat counter,鼓勵 agent 試喝藥
+# (跨 2999 ep 數據:83% LOSE ep heal=0,但 heal>=2 ep WIN rate 是 heal=0 的 3-15x)。
+# Breakeven 計算:
+#   - Heal 動畫 ~30 game frame = 15 Python step(30Hz Python vs 60Hz game)
+#   - Speed bonus 損失:200/eff_max(1920 at scale 0.15)× 15 = -1.6/heal
+#   - Opportunity cost(missed boss hits during animation)= -1 ~ -2/heal
+#   - 總 cost 範圍 -1.6 ~ -3.6,中間 -2.6 → W=3.0 中間情境 net +0.4(微正激勵)
+# 跟 W_HEAL_SUCCESS_Q 互補:Q 教「低血急救」(殘 50% +30 主訊號),
+# counter 給「敢喝」baseline(平均 +0.4/heal,讓 PPO 探索 attack=5 logit)。
+# Spam 風險低:env.py 已 mask 滿血(php_pct>=99%)attack=5,8 瓶 cap × 3 = +24 上限,
+# WIN ret ~800 的 3%,跟 W_PARRY 系列同範圍不會 dominate。
+W_HEAL_COUNTER    = 3.0
 # rebuilt 2026-06-15 Round 22: 復活 Round 3/5 attempt incentive。
 # 純 success-only reward 對 fresh policy 是 chicken-and-egg(沒成功 → 不學 → 永遠不成功)。
 # 2026-06-15: 0.5 → 2.0,加大「嘗試 parry」誘因。gate 已 spam-proof(只在 boss
 # windup cat 1-5 + attack=3 edge + 非自己動作後搖期觸發),提高權重不會開出 spam
 # local optimum;且仍遠低於成功 parry 的 20/50,主梯度依舊指向「擋成功」而非「亂按」。
-W_PARRY_ATTEMPT   = 2.0
+W_PARRY_ATTEMPT   = 1.0
 
 # v1.18.0 防禦引導（v1.19.0: evade 8→2，降 per-second 主導性）
 W_EVADE_PS               = 2.0   # 每秒：boss 在 windup/attacking 且玩家在 range 內、這幀沒挨打 → 加分
@@ -99,6 +111,13 @@ def compute_reward(prev: dict | None, cur: dict, use_instrumental: bool = True) 
             # dphp ∈ (0,1]:回 10% = +1.2,回 30% = +10.8,回 50% = +30,回 80% = +76.8
             # 小 top-off 幾乎沒分,低血急救重賞。env.py mask 已擋滿血(php_pct>=99%)attack=5。
             r += W_HEAL_SUCCESS_Q * dphp * dphp
+
+        # 2026-06-24 Round 28: per-heal-event flat counter(state-delta 偵測 game-side 真喝)
+        # Q quadratic 教低血急救,counter 給「敢喝」baseline。中間情境 net +0.4 微正激勵。
+        prev_potion = prev.get("potion_left", 8)
+        cur_potion = cur.get("potion_left", 8)
+        if cur_potion < prev_potion:
+            r += W_HEAL_COUNTER
 
         if cur.get("boss_present") and prev.get("boss_present"):
             dbhp = cur.get("bhp_pct", 1.0) - prev.get("bhp_pct", 1.0)
